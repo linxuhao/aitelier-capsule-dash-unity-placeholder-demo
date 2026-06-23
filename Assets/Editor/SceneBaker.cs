@@ -2,6 +2,7 @@
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
+using System.IO; // For Directory.CreateDirectory belt-and-suspenders
 
 /// <summary>
 /// Editor-only static class that provides the "Tools / Bake Scene to Hierarchy" menu item.
@@ -26,12 +27,14 @@ public static class SceneBaker
     /// Flow:
     /// 1. Guard against Play mode — show dialog if in Play mode.
     /// 2. Guard against already-baked scene — warn if GameManager exists.
-    /// 3. Find existing SceneBootstrapper in scene, or create a temporary one.
-    /// 4. Disable auto-build on the bootstrapper via SerializedObject.
-    /// 5. Call bootstrapper.BuildScene() to construct all GameObjects.
-    /// 6. Destroy the temporary bootstrapper GameObject if we created one.
-    /// 7. Mark the scene dirty so the user knows to save.
-    /// 8. Log a success message.
+    /// 3. Ensure the Assets/Editor/ directory exists (belt-and-suspenders).
+    /// 4. Show confirmation dialog to prevent accidental bake.
+    /// 5. Find existing SceneBootstrapper in scene, or create a temporary one.
+    /// 6. Disable auto-build on the bootstrapper via SerializedObject.
+    /// 7. Call bootstrapper.BuildScene() to construct all GameObjects.
+    /// 8. Destroy the temporary bootstrapper GameObject if we created one.
+    /// 9. Mark the scene dirty so the user knows to save.
+    /// 10. Log a success message.
     /// </summary>
     [MenuItem(MENU_PATH)]
     public static void BakeScene()
@@ -64,7 +67,24 @@ public static class SceneBaker
             return;
         }
 
-        // --- 3. Find or create a temporary SceneBootstrapper ---
+        // --- 3. Ensure the Assets/Editor/ directory exists ---
+        // In a fresh project, this folder might not exist yet. Directory.CreateDirectory
+        // is idempotent — it does nothing if the folder already exists. This is a
+        // defensive belt-and-suspenders measure.
+        Directory.CreateDirectory("Assets/Editor");
+
+        // --- 4. Confirmation dialog ---
+        // Prevents accidental bake from a mis-click on the menu item.
+        bool proceed = EditorUtility.DisplayDialog(
+            "Bake Scene",
+            "This will build all runtime GameObjects into the scene hierarchy.\n" +
+            "Proceed?",
+            "Bake",
+            "Cancel"
+        );
+        if (!proceed) return;
+
+        // --- 5. Find or create a temporary SceneBootstrapper ---
         // If there's already a SceneBootstrapper in the scene (e.g., user added one
         // to an empty scene but hasn't played yet), reuse it. Otherwise create a
         // temporary one solely for the bake call.
@@ -78,7 +98,7 @@ public static class SceneBaker
             createdTemp = true;
         }
 
-        // --- 4. Disable auto-build via SerializedObject ---
+        // --- 6. Disable auto-build via SerializedObject ---
         // The _buildOnAwake field is [SerializeField] private. Using SerializedObject
         // is cleaner than raw reflection and works with Unity's serialization system.
         SerializedObject so = new SerializedObject(bootstrapper);
@@ -94,14 +114,14 @@ public static class SceneBaker
                              "Proceeding anyway — Awake may double-build.");
         }
 
-        // --- 5. Build the scene ---
+        // --- 7. Build the scene ---
         // This creates all GameObjects (ground, player, camera, UI, GameManager,
         // ObstacleSpawner, lane markers, EventSystem) in Edit mode. Because we are
         // NOT in Play mode, these objects become persistent in the scene hierarchy
         // and can be saved.
         bootstrapper.BuildScene();
 
-        // --- 6. Clean up temporary bootstrapper ---
+        // --- 8. Clean up temporary bootstrapper ---
         // If we created a temporary GameObject just for baking, destroy it now.
         // The built objects remain in the scene.
         if (createdTemp && bootstrapper != null && bootstrapper.gameObject != null)
@@ -109,12 +129,12 @@ public static class SceneBaker
             Object.DestroyImmediate(bootstrapper.gameObject);
         }
 
-        // --- 7. Mark scene dirty ---
+        // --- 9. Mark scene dirty ---
         // This causes the asterisk to appear in the Hierarchy tab title, reminding
         // the user to save (Ctrl+S) to persist the baked objects.
         EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
 
-        // --- 8. Log success ---
+        // --- 10. Log success ---
         Debug.Log("[SceneBaker] Scene baked successfully. Save the scene (Ctrl+S) to persist.");
     }
 }
