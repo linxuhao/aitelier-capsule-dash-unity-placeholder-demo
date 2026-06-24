@@ -2,7 +2,7 @@ using UnityEngine;
 using UnityEngine.Pool;
 
 /// <summary>
-/// Spawns cube obstacles ahead of the player using distance-based intervals and
+/// Spawns cube obstacles ahead of the player using virtual-distance-based intervals and
 /// an ObjectPool<GameObject> for zero-allocation reuse. Obstacles are placed in
 /// one of three lanes (left, center, right) with same-lane avoidance.
 ///
@@ -10,8 +10,12 @@ using UnityEngine.Pool;
 /// self-supplies its obstacle material via Placeholders.CreateMaterial(Color.red)
 /// fallback if no material is assigned in the Inspector.
 ///
-/// Spawning uses distance thresholds (_nextSpawnZ) rather than time intervals,
-/// ensuring consistent obstacle density regardless of forward speed changes.
+/// Spawning uses a virtual _scrollDistance counter (incremented each frame by
+/// ForwardSpeed * dt) rather than the player's actual Z position. This decouples
+/// spawn timing from player movement, so obstacles spawn correctly even when the
+/// player is stationary at Z=0 (player-stationary refactor). The virtual distance
+/// conceptually represents "how far the world has scrolled" and mirrors
+/// GameManager.Distance accumulation.
 /// </summary>
 public class ObstacleSpawner : MonoBehaviour
 {
@@ -29,13 +33,13 @@ public class ObstacleSpawner : MonoBehaviour
     [SerializeField] private float _spawnDistance = 35f;
 
     /// <summary>
-    /// Minimum gap (in world units) between consecutive obstacle spawns.
+    /// Minimum gap (in virtual scroll distance units) between consecutive obstacle spawns.
     /// Used with _maxSpawnGap to randomise spacing.
     /// </summary>
     [SerializeField] private float _minSpawnGap = 6f;
 
     /// <summary>
-    /// Maximum gap (in world units) between consecutive obstacle spawns.
+    /// Maximum gap (in virtual scroll distance units) between consecutive obstacle spawns.
     /// Used with _minSpawnGap to randomise spacing.
     /// </summary>
     [SerializeField] private float _maxSpawnGap = 16f;
@@ -67,11 +71,24 @@ public class ObstacleSpawner : MonoBehaviour
     private Transform _player;
 
     /// <summary>
-    /// Z-position threshold for the next obstacle spawn. When the player's Z
-    /// exceeds this value, a new obstacle is spawned and _nextSpawnZ is advanced.
-    /// Initialised to 20f so the first obstacle appears shortly after the run starts.
+    /// Virtual scroll distance threshold for the next obstacle spawn. When this
+    /// virtual distance (which represents "how far the world has scrolled")
+    /// exceeds _nextSpawnZ, a new obstacle is spawned and _nextSpawnZ is advanced.
+    /// Initialised to 0f so the first obstacle spawns immediately as _scrollDistance
+    /// passes 0 on the first frame of gameplay.
     /// </summary>
-    private float _nextSpawnZ = 20f;
+    private float _nextSpawnZ = 0f;
+
+    /// <summary>
+    /// Virtual scroll distance counter. Increments each frame by
+    /// GameManager.Instance.ForwardSpeed * Time.deltaTime, conceptually
+    /// representing "how far the world has scrolled." Replaces the old
+    /// _player.position.z-based spawn trigger, decoupling spawning from
+    /// actual player position so obstacles spawn correctly when the player
+    /// is stationary at Z=0.
+    /// Default value 0f by C# field initialisation.
+    /// </summary>
+    private float _scrollDistance;
 
     /// <summary>
     /// Last lane an obstacle was placed in (0=left, 1=center, 2=right).
@@ -150,9 +167,10 @@ public class ObstacleSpawner : MonoBehaviour
 
     /// <summary>
     /// Called every frame. Guards against null GameManager, GameOver state, and
-    /// missing player reference. When the player's Z position exceeds _nextSpawnZ,
-    /// spawns an obstacle in a random lane (with same-lane avoidance), configures
-    /// it, and advances the spawn threshold.
+    /// missing player reference. Advances the virtual scroll distance counter and,
+    /// when _scrollDistance exceeds _nextSpawnZ, spawns an obstacle in a random
+    /// lane (with same-lane avoidance), configures it, and advances the spawn
+    /// threshold using virtual distance.
     /// </summary>
     private void Update()
     {
@@ -164,8 +182,14 @@ public class ObstacleSpawner : MonoBehaviour
         if (_player == null)
             return;
 
-        // Distance-based spawn check
-        if (_player.position.z >= _nextSpawnZ)
+        // Advance virtual scroll distance (decoupled from actual player position)
+        // This conceptually represents "how far the world has scrolled" and mirrors
+        // GameManager.Distance accumulation. Replaces the old _player.position.z
+        // check so obstacles spawn correctly when player is stationary at Z=0.
+        _scrollDistance += GameManager.Instance.ForwardSpeed * Time.deltaTime;
+
+        // Virtual-distance-based spawn check (was: _player.position.z >= _nextSpawnZ)
+        if (_scrollDistance >= _nextSpawnZ)
         {
             // Random lane selection with same-lane avoidance
             int lane = Random.Range(0, 3);
@@ -177,7 +201,8 @@ public class ObstacleSpawner : MonoBehaviour
             // Retrieve obstacle from pool
             GameObject obstacle = _pool.Get();
 
-            // Position ahead of the player
+            // Position ahead of the player (formula unchanged — with stationary player
+            // at Z=0, obstacles spawn at world Z=_spawnDistance and scroll toward player)
             float xPos = (lane - 1) * _laneSpacing;
             obstacle.transform.position = new Vector3(xPos, 0.5f, _player.position.z + _spawnDistance);
 
@@ -194,8 +219,9 @@ public class ObstacleSpawner : MonoBehaviour
 
             _lastLane = lane;
 
-            // Advance spawn threshold by a random distance gap
-            _nextSpawnZ = _player.position.z + Random.Range(_minSpawnGap, _maxSpawnGap);
+            // Advance spawn threshold by a random gap from the CURRENT virtual distance
+            // (was: _player.position.z + Random.Range(...))
+            _nextSpawnZ = _scrollDistance + Random.Range(_minSpawnGap, _maxSpawnGap);
 
             Debug.Log($"Spawned obstacle in lane {lane} at Z={obstacle.transform.position.z:F1}");
         }
