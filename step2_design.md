@@ -1,75 +1,107 @@
-# Technical Architecture Design — 3D Endless Runner (Flappy in 3D)
+# Technical Architecture Design — Capsule Dash: Player-Stationary Refactor & Bug Fixes
 
 ## Overview
 
-A Unity 6 (6000.0+) pure-C# 3D endless runner. A capsule character auto-runs forward along the Z axis in a three-lane corridor. The player dodges left/right between lanes and jumps over oncoming cube obstacles. Collision ends the run; distance score tracks survival. All visuals are runtime-generated primitives; no binary assets are delivered.
+This design refactors the Capsule Dash 3D endless runner to fix three bugs:
+1. **Distance display frozen in bake mode** — root cause: UIManager event-subscription ordering edge case (GameManager.Instance null during Start() in baked scenes).
+2. **No obstacle spawning in bake mode** — root cause: with stationary player, `_player.position.z` never changes, so the distance-based spawn trigger never fires after the initial threshold.
+3. **Player falls off the runway** — root cause: player auto-runs forward on a finite ground plane; after ~13 seconds they hit the end.
 
-**Core architecture**: A `SceneBootstrapper.BuildScene()` method is the single source of truth for constructing the playable scene — called at runtime in `Awake()` for "press Play and play", and called from an Editor menu item (`Tools > Bake Scene to Hierarchy`) in Edit mode to persist the generated GameObjects into the scene for manual asset replacement. All components are wired in `BuildScene()`; no component relies on Awake ordering.
+The refactor makes the player **stationary on Z** (obstacles scroll toward them), adds a **code-driven wind/particle effect** to visually convey forward motion, and **hardens UIManager** for baked-scene initialization ordering. The goal is identical gameplay in both `press Play` (runtime bootstrap) and `Tools > Bake Scene to Hierarchy + Play` (baked scene) modes.
+
+All changes integrate into the existing `SceneBootstrapper.BuildScene()` single-source-of-truth, the self-supplying `[SerializeField]` pattern, and the `Placeholders` runtime-asset utility.
 
 ---
 
 ## Architecture Diagram (Text)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     SceneBootstrapper                       │
-│  Awake() → if not built → BuildScene()                     │
-│  BuildScene(): single source of truth for wiring           │
-└──────────┬──────────────────────────────────────────────────┘
-           │ creates & wires all GameObjects
-           ▼
-┌──────────────────────────────────────────────────────────────┐
-│  ┌──────────┐  ┌───────────┐  ┌────────────┐  ┌──────────┐ │
-│  │  Player  │  │  Camera   │  │  UI Canvas  │  │  Ground  │ │
-│  │ (Capsule)│  │ (Follow)  │  │ (TMP Score) │  │ (Plane)  │ │
-│  └────┬─────┘  └─────┬─────┘  └──────┬─────┘  └──────────┘ │
-│       │              │               │                      │
-│  ┌────┴──────────────┴───────────────┴───────────────────┐  │
-│  │                   GameManager                         │  │
-│  │  [DefaultExecutionOrder(-100)] singleton              │  │
-│  │  State: Playing / GameOver                            │  │
-│  │  Distance score tracking                              │  │
-│  │  GameOver() / Restart()                               │  │
-│  └──────────────────────┬───────────────────────────────┘  │
-│                         │                                   │
-│  ┌──────────────────────┴───────────────────────────────┐  │
-│  │              ObstacleSpawner                          │  │
-│  │  Owns ObjectPool<GameObject> (cube prefabs)           │  │
-│  │  Spawns ahead of player in random lanes               │  │
-│  └──────────────────────┬───────────────────────────────┘  │
-│                         │                                   │
-│  ┌──────────────────────┴───────────────────────────────┐  │
-│  │              Obstacle (per-instance)                  │  │
-│  │  Scrolls toward player each frame                     │  │
-│  │  Self-returns to pool when past player                │  │
-│  └──────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                      SceneBootstrapper                           │
+│  Awake() → if not built → BuildScene()                          │
+│  BuildScene(): single source of truth — creates & wires ALL     │
+│  GameObjects: Player, Camera, UI, GameManager, ObstacleSpawner,  │
+│  WindEffect, Ground, EventSystem, LaneMarkers                    │
+└───────┬──────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  ┌──────────────────┐   ┌──────────────────┐                     │
+│  │     Player       │   │     Camera       │                     │
+│  │   (Capsule)      │   │  (Follow, fixed  │                     │
+│  │   Z=0 stationary │   │   Z offset)      │                     │
+│  │  ┌─────────────┐ │   └────────┬─────────┘                     │
+│  │  │ WindEffect   │ │            │                              │
+│  │  │ (child GO,   │ │            │                              │
+│  │  │ ParticleSys) │ │            │                              │
+│  │  └─────────────┘ │            │                              │
+│  └────────┬─────────┘            │                              │
+│           │                      │                              │
+│  ┌────────┴──────────────────────┴────────────────────────┐     │
+│  │                    GameManager                          │     │
+│  │  [DefaultExecutionOrder(-100)] singleton                │     │
+│  │  State: Distance += ForwardSpeed * Time.deltaTime       │     │
+│  │  Events: OnGameOver, OnRestart                          │     │
+│  └──────────────────────┬─────────────────────────────────┘     │
+│                         │                                        │
+│  ┌──────────────────────┴─────────────────────────────────┐     │
+│  │                 ObstacleSpawner                         │     │
+│  │  ObjectPool<GameObject> (cube obstacles)                │     │
+│  │  Virtual _scrollDistance counter (NOT player.position.z)│     │
+│  │  Spawns at player.Z + _spawnDistance                    │     │
+│  └──────────────────────┬─────────────────────────────────┘     │
+│                         │                                        │
+│  ┌──────────────────────┴─────────────────────────────────┐     │
+│  │              Obstacle (per-instance)                    │     │
+│  │  Scrolls toward player: Vector3.back * speed * dt       │     │
+│  │  Self-returns to pool when Z < player.Z - 10f           │     │
+│  └────────────────────────────────────────────────────────┘     │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │                  UI Canvas                              │     │
+│  │  UIManager: ScoreText (HUD) + GameOverPanel             │     │
+│  │  Lazy re-subscription if GameManager null at Start()    │     │
+│  └────────────────────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### Data Flow
+### Data Flow (Updated)
 
 ```
 UPDATE LOOP:
-  InputHandler reads Keyboard.current → exposes LeftPressed/RightPressed/JumpPressed/RestartPressed
-  PlayerController reads InputHandler → lane switch (X lerp) / jump (Rigidbody impulse)
-  PlayerController auto-runs: Rigidbody.velocity.z = forwardSpeed
-  ObstacleSpawner spawns cubes at spawnDistance ahead of player, random lane
-  Each Obstacle moves: transform.position.z -= scrollSpeed * Time.deltaTime
-  Each Obstacle checks: if Z < player.z - despawnDistance → return to pool
-  GameManager.Update(): Distance += forwardSpeed * Time.deltaTime
+  InputHandler reads Keyboard.current → LeftPressed/RightPressed/JumpPressed/RestartPressed
+  PlayerController reads InputHandler → lane switch (X lerp) / jump (Impulse)
+  PlayerController: Z velocity = 0 (STATIONARY — was ForwardSpeed)
+  GameManager.Update(): Distance += ForwardSpeed * Time.deltaTime
+  ObstacleSpawner: _scrollDistance += ForwardSpeed * Time.deltaTime (VIRTUAL)
+    if _scrollDistance >= _nextSpawnZ → spawn obstacle at player.Z + _spawnDistance
+  Each Obstacle: transform.position += Vector3.back * scrollSpeed * dt
+  Each Obstacle: if Z < player.Z - 10f → return to pool
   UIManager reads GameManager.Distance → updates TMP text
+  WindEffect: ParticleSystem auto-emits speed lines in World space
 
 LATE UPDATE:
-  CameraFollow: transform.position = player.position + offset (smooth Lerp)
-  CameraFollow: transform.LookAt(player)
+  CameraFollow: transform.position = player.position + offset (smooth Lerp, Z never changes)
 
-COLLISION (Player.OnCollisionEnter vs obstacle):
-  PlayerController detects collision with tag "Obstacle"
-  → calls GameManager.Instance.GameOver()
-  → GameManager sets state = GameOver, disables PlayerController
-  → UIManager shows GameOver panel + restart prompt
-  → Player presses Restart → GameManager.Restart() → SceneManager.LoadScene(0)
+COLLISION (Player.OnCollisionEnter vs Obstacle tag):
+  → GameManager.GameOver() → UI shows panel → R restarts scene
 ```
+
+### Key Architectural Change: Virtual Scroll Distance
+
+The old design coupled obstacle spawning to `_player.position.z`:
+```
+if (_player.position.z >= _nextSpawnZ) → spawn
+```
+
+With a stationary player at Z=0, this trigger fires only once (Z=0 < _nextSpawnZ=20f → never spawns). The fix introduces a **virtual scroll distance** counter that conceptually represents "how far the world has scrolled":
+
+```
+_scrollDistance += ForwardSpeed * Time.deltaTime;  // virtual world scroll
+if (_scrollDistance >= _nextSpawnZ) → spawn
+```
+
+`_scrollDistance` increments identically to `GameManager.Distance` — the two remain in sync, but `_scrollDistance` is local to `ObstacleSpawner` (no cross-component dependency).
 
 ---
 
@@ -78,414 +110,484 @@ COLLISION (Player.OnCollisionEnter vs obstacle):
 ```
 Assets/
   Scripts/
-    Placeholders.cs          — Static utility: CreatePrimitive(), CreateMaterial()
-    SceneBootstrapper.cs     — MonoBehaviour: BuildScene() wiring method
-    GameManager.cs           — Singleton: game state, distance score
-    PlayerController.cs      — Auto-run, lane switch, jump, collision
-    CameraFollow.cs          — Smooth 3D follow camera
-    ObstacleSpawner.cs       — ObjectPool owner, spawns obstacles
-    Obstacle.cs              — Per-obstacle scroll & pool return
-    UIManager.cs             — Score display + Game Over panel
-    InputHandler.cs          — New Input System wrapper
+    Placeholders.cs           — (NO CHANGE) Static: CreatePrimitive(), CreateMaterial()
+    SceneBootstrapper.cs      — (MODIFY) BuildScene(): larger ground, attach WindEffect to player
+    GameManager.cs            — (NO CHANGE) Distance scoring already survival-time-based
+    PlayerController.cs       — (MODIFY) FixedUpdate: set Z velocity to 0 instead of ForwardSpeed
+    CameraFollow.cs           — (NO CHANGE) Works unchanged with player at fixed Z
+    ObstacleSpawner.cs        — (MODIFY) Virtual _scrollDistance replaces _player.position.z
+    Obstacle.cs               — (MINOR) Despawn threshold adjusts for stationary player
+    UIManager.cs              — (MODIFY) Lazy event re-subscription in Update()
+    InputHandler.cs           — (NO CHANGE) Lane switch & jump input unchanged
+    WindEffect.cs             — (NEW) ParticleSystem speed-lines effect attached to player
   Editor/
-    SceneBaker.cs            — [MenuItem] "Tools/Bake Scene to Hierarchy"
-RESOURCES.md                 — Optional asset-replacement guide
+    SceneBaker.cs             — (NO CHANGE) Calls BuildScene(); no structural changes needed
+RESOURCES.md                  — (MODIFY) Add WindEffect material replacement instructions
 ```
 
 ---
 
 ## Component Specifications
 
-### 1. Placeholders (`Assets/Scripts/Placeholders.cs`)
+### 1. PlayerController (MODIFY)
 
-**Type**: Static utility class (not a MonoBehaviour).
+**File**: `Assets/Scripts/PlayerController.cs`
 
-**Responsibility**: Create colored primitive GameObjects and materials at runtime with no imported assets.
+**Changes**: 
 
-**Public API**:
+**FixedUpdate()** — Remove the forward auto-run velocity on Z. The player stays at Z=0:
+
 ```csharp
-public static class Placeholders
-{
-    /// <summary>Creates a primitive GameObject with a solid-color material.</summary>
-    public static GameObject CreatePrimitive(PrimitiveType type, Color color, string name = null);
+// OLD:
+_rb.velocity = new Vector3(0f, _rb.velocity.y, forwardSpeed);
 
-    /// <summary>Creates a simple unlit Material with the given color.</summary>
-    public static Material CreateMaterial(Color color);
+// NEW:
+_rb.velocity = new Vector3(0f, _rb.velocity.y, 0f);
+```
+
+This is a one-line change. Everything else — lane switching (X lerp via Transform), jumping (Y impulse), ground check (raycast down), collision death, death visual (material color → red) — remains unchanged.
+
+**Rationale**: The SOTA report confirms this is the standard endless-runner pattern. Player never moves forward, so bug #3 (falling off) is eliminated — the player stays at Z=0 forever.
+
+**No new serialized fields needed.**
+
+---
+
+### 2. ObstacleSpawner (MODIFY)
+
+**File**: `Assets/Scripts/ObstacleSpawner.cs`
+
+**Changes**: Replace `_player.position.z` with a virtual `_scrollDistance` counter for spawn triggering.
+
+**New runtime state**:
+```csharp
+/// <summary>
+/// Virtual scroll distance counter. Increments each frame by ForwardSpeed * dt,
+/// conceptually representing "how far the world has scrolled." Replaces
+/// _player.position.z as the spawn trigger — decouples spawning from actual
+/// player position so obstacles spawn correctly when player is stationary at Z=0.
+/// </summary>
+private float _scrollDistance;
+```
+
+**Modified Update() logic**:
+```csharp
+private void Update()
+{
+    // Guard: GameManager must exist and game must be playing
+    if (GameManager.Instance == null || GameManager.Instance.IsGameOver)
+        return;
+    if (_player == null)
+        return;
+
+    // Advance virtual scroll distance (replaces _player.position.z)
+    _scrollDistance += GameManager.Instance.ForwardSpeed * Time.deltaTime;
+
+    // Spawn check against virtual distance
+    if (_scrollDistance >= _nextSpawnZ)
+    {
+        // ... spawn logic unchanged (lane selection, pool.Get(), positioning, Configure) ...
+
+        // Advance spawn threshold from current virtual distance
+        _nextSpawnZ = _scrollDistance + Random.Range(_minSpawnGap, _maxSpawnGap);
+    }
 }
 ```
 
-**Internal**: `CreateMaterial` uses `new Material(Shader.Find("Universal Render Pipeline/Lit"))` with a fallback chain (URP → Standard → Unlit/Color). Sets `_BaseColor` / `_Color` depending on the shader found. `CreatePrimitive` calls `GameObject.CreatePrimitive(type)`, replaces its default material with the result of `CreateMaterial(color)`.
+**Spawn position formula** stays the same:
+```csharp
+obstacle.transform.position = new Vector3(xPos, 0.5f, _player.position.z + _spawnDistance);
+```
+With the player at Z=0, this becomes `Z = _spawnDistance` (e.g., 35f). Obstacles appear at a fixed world Z ahead of the player and scroll backward toward them.
 
-**Edge cases**: If no compatible shader is found, falls back to `Shader.Find("Unlit/Color")` which is guaranteed in all Unity render pipelines. The material uses `HideFlags.HideAndDontSave` when created during Play mode only.
+**Initial `_nextSpawnZ`**: Changed from `20f` to `0f` so the first obstacle spawns immediately (the virtual distance starts at 0 and increments, crossing `_nextSpawnZ` on the very first frame). Alternatively, keep at `20f` for a short grace period before the first spawn.
+
+**No new serialized fields needed.**
 
 ---
 
-### 2. SceneBootstrapper (`Assets/Scripts/SceneBootstrapper.cs`)
+### 3. Obstacle (MINOR)
 
-**Type**: MonoBehaviour. The user adds this to an empty GameObject in an otherwise-empty scene.
+**File**: `Assets/Scripts/Obstacle.cs`
 
-**Responsibility**: Single source of truth for constructing the playable scene. Called at runtime (Awake) and at edit time (Bake menu).
+**Changes**: The despawn check already works correctly with a stationary player, but the threshold can be tightened for efficiency:
 
-**Fields**:
 ```csharp
-[SerializeField] private bool _buildOnAwake = true;
-private static bool _sceneBuilt = false;
+// OLD: if (transform.position.z < _player.position.z - 10f)
+// With player at Z=0, this is: z < -10f. Still correct, but obstacles scroll
+// unnecessarily far behind the player before recycling.
+
+// NEW: unchanged logic, but consider reducing the threshold to 5f-8f
+// if performance tuning is desired. No functional bug here — left as-is.
 ```
 
-**Public API**:
-```csharp
-public void BuildScene()
-```
-
-**BuildScene() sequence**:
-
-1. **Guard**: If `FindObjectOfType<GameManager>() != null`, return (scene already built).
-2. **Physics**: Set `Physics.gravity = new Vector3(0, -25f, 0)`.
-3. **Ground**: Create Plane primitive (gray), scale (3, 1, 20), position (0, 0, 10). Tag "Ground".
-4. **Player**: Create Capsule primitive (blue), position (0, 1, 0), tag "Player". Add `Rigidbody` (constraints: freeze rotation XYZ + freeze position X during running; mass=1, drag=0). Add `PlayerController`. Add `InputHandler`.
-5. **Camera**: Find or create MainCamera. Set position behind/above player. Add `CameraFollow`. Clear flags = Skybox, background = dark gray.
-6. **UI Canvas**: Create GameObject "UI", add `Canvas` (RenderMode=ScreenSpaceOverlay), `CanvasScaler` (ScaleWithScreenSize, ref=1920x1080), `GraphicRaycaster`. Create child "ScoreText" with `TextMeshProUGUI`. Create child "GameOverPanel" (initially inactive) with "GameOverTitle" and "RestartPrompt" TMP texts. Add `UIManager`.
-7. **EventSystem**: Create if not present (needed for UI raycasting).
-8. **GameManager**: Create GameObject "GameManager", add `GameManager` component (execution order -100).
-9. **ObstacleSpawner**: Create GameObject "ObstacleSpawner", add `ObstacleSpawner` component. Its pool and spawn parameters are configured via its own Awake/Start.
-10. **Lane Markers** (optional visual aid): Three thin Cylinder primitives (dark gray) at Z positions 5, 10, 15, 20, 25; X = -2, 0, +2.
-11. **Mark built**: `_sceneBuilt = true`.
-
-**Important**: In Play mode, after `BuildScene()` completes, the bootstrapper destroys its own GameObject (the bootstrapper is no longer needed). In Edit mode (bake), the bootstrapper is destroyed by the caller (SceneBaker).
+**No required changes to Obstacle.cs.** The existing despawn logic (`z < player.z - 10f`) works identically with a stationary player. The only difference is that `player.z` is now always 0 instead of increasing. Obstacles scroll from e.g. Z=35 down past Z=-10 and recycle — same behavior.
 
 ---
 
-### 3. GameManager (`Assets/Scripts/GameManager.cs`)
+### 4. GameManager (NO CHANGE)
 
-**Type**: MonoBehaviour singleton, `[DefaultExecutionOrder(-100)]`.
+**File**: `Assets/Scripts/GameManager.cs`
 
-**Responsibility**: Central game state authority. Tracks distance score. Orchestrates Game Over and Restart.
+**No changes needed.** The distance scoring formula `Distance += ForwardSpeed * Time.deltaTime` is already survival-time-based. It accumulates correctly in both Play mode and baked scenes because `Update()` ticks in both cases when Play is pressed. The `[DefaultExecutionOrder(-100)]` attribute already ensures correct Awake ordering.
 
-**Public API**:
+---
+
+### 5. UIManager (MODIFY)
+
+**File**: `Assets/Scripts/UIManager.cs`
+
+**Changes**: Add lazy event re-subscription in `Update()` to handle the baked-scene edge case where `GameManager.Instance` is unexpectedly null during `Start()`.
+
+**In Start()**, the existing null guard logs a warning if GameManager.Instance is null. The fix adds a recovery path:
+
 ```csharp
-public class GameManager : MonoBehaviour
+// New field:
+private bool _eventsSubscribed;
+
+private void Start()
 {
-    public static GameManager Instance { get; private set; }
+    // ... existing self-supply discovery (Find ScoreText, GameOverPanel, etc.) ...
 
-    public float Distance { get; private set; }        // running distance score
-    public bool IsGameOver { get; private set; }       // current state
-    public float ForwardSpeed => 8f;                    // shared forward speed constant
+    _inputHandler = FindObjectOfType<InputHandler>();
 
-    public event System.Action OnGameOver;
-    public event System.Action OnRestart;
+    // Attempt subscription (may fail if GameManager not yet ready)
+    TrySubscribeEvents();
 
-    public void GameOver();    // triggers death sequence
-    public void Restart();     // reloads scene
+    if (_gameOverPanel != null)
+        _gameOverPanel.SetActive(false);
+}
+
+private void TrySubscribeEvents()
+{
+    if (_eventsSubscribed) return;
+
+    if (GameManager.Instance != null)
+    {
+        GameManager.Instance.OnGameOver += ShowGameOver;
+        GameManager.Instance.OnRestart += HideGameOver;
+        _eventsSubscribed = true;
+    }
+}
+
+private void Update()
+{
+    // Lazy re-subscription: if events weren't subscribed in Start(),
+    // try again each frame until successful.
+    if (!_eventsSubscribed)
+    {
+        TrySubscribeEvents();
+    }
+
+    if (GameManager.Instance == null)
+        return;
+
+    if (!GameManager.Instance.IsGameOver)
+        UpdateScoreText();
+    else
+        CheckRestartInput();
 }
 ```
 
-**Awake**: Singleton enforcement (`if (Instance != null) Destroy(gameObject); else Instance = this;`).
-
-**Update**: If `!IsGameOver`, `Distance += ForwardSpeed * Time.deltaTime`.
-
-**GameOver()**: Sets `IsGameOver = true`, invokes `OnGameOver` event. UIManager and PlayerController subscribe to this.
-
-**Restart()**: `SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex)`.
+**Rationale**: In baked scenes, the execution order of `Start()` across components is undefined. UIManager.Start() may run before GameManager's singleton assignment completes (even with `[DefaultExecutionOrder(-100)]`, which only affects Awake, not Start). The lazy retry pattern ensures that if the initial subscription fails, it will succeed on a subsequent frame once GameManager.Instance is populated.
 
 ---
 
-### 4. InputHandler (`Assets/Scripts/InputHandler.cs`)
+### 6. WindEffect (NEW)
 
-**Type**: MonoBehaviour. Attached to the Player GameObject by the bootstrapper.
+**File**: `Assets/Scripts/WindEffect.cs`
 
-**Responsibility**: Single point of input querying. Wraps `UnityEngine.InputSystem` (Keyboard, Mouse, Touchscreen) for cross-platform support. No `.inputactions` assets — direct C# device queries with null guards.
+**Type**: MonoBehaviour. Attached to a child GameObject of the Player by `SceneBootstrapper.BuildScene()`.
 
-**Public API**:
+**Responsibility**: Creates and configures a fully code-driven `ParticleSystem` that emits speed lines / dust particles rushing past the player from front to back, visually conveying forward motion even though the player is stationary.
+
+**Serialized Fields** (self-supplying):
 ```csharp
-public class InputHandler : MonoBehaviour
+/// <summary>
+/// Material applied to wind particles. If null at Awake, a white semi-transparent
+/// placeholder material is created via Placeholders.CreateMaterial().
+/// </summary>
+[SerializeField] private Material _particleMaterial;
+
+/// <summary>
+/// Speed at which particles move backward (world units/sec). Defaults to
+/// GameManager.Instance.ForwardSpeed if available, otherwise 8f.
+/// </summary>
+[SerializeField] private float _particleSpeed = 8f;
+
+/// <summary>
+/// Number of particles emitted per second. Higher = denser speed lines.
+/// </summary>
+[SerializeField] private float _emissionRate = 50f;
+
+/// <summary>
+/// Lifetime of each particle in seconds.
+/// </summary>
+[SerializeField] private float _particleLifetime = 2f;
+
+/// <summary>
+/// Width of the emission box (X axis, across lanes).
+/// </summary>
+[SerializeField] private float _emissionWidth = 8f;
+
+/// <summary>
+/// Height of the emission box (Y axis).
+/// </summary>
+[SerializeField] private float _emissionHeight = 1f;
+
+/// <summary>
+/// Depth of the emission box (Z axis, along the run direction).
+/// </summary>
+[SerializeField] private float _emissionDepth = 3f;
+
+/// <summary>
+/// Z offset of the emission box center from the player. Positive = ahead of player.
+/// </summary>
+[SerializeField] private float _emissionZOffset = 5f;
+```
+
+**Awake logic**:
+```csharp
+private void Awake()
 {
-    public bool LeftPressed  { get; private set; }
-    public bool RightPressed { get; private set; }
-    public bool JumpPressed  { get; private set; }
-    public bool RestartPressed { get; private set; }
+    // Self-supply material
+    if (_particleMaterial == null)
+    {
+        // White, semi-transparent — particles look like dust/speed lines
+        _particleMaterial = Placeholders.CreateMaterial(new Color(1f, 1f, 1f, 0.4f));
+    }
+
+    // Resolve speed from GameManager if not explicitly set
+    if (_particleSpeed <= 0f && GameManager.Instance != null)
+    {
+        _particleSpeed = GameManager.Instance.ForwardSpeed;
+    }
+
+    // Create and configure the ParticleSystem
+    ParticleSystem ps = gameObject.AddComponent<ParticleSystem>();
+    ConfigureParticleSystem(ps);
+}
+
+private void ConfigureParticleSystem(ParticleSystem ps)
+{
+    // --- Main Module ---
+    var main = ps.main;
+    main.startSpeed = _particleSpeed;           // particles move backward (Vector3.back is emission direction)
+    main.startLifetime = _particleLifetime;
+    main.startSize = 0.05f;                     // thin lines
+    main.startColor = new Color(1f, 1f, 1f, 0.5f);
+    main.simulationSpace = ParticleSystemSimulationSpace.World;  // particles flow past player, don't follow
+    main.playOnAwake = true;
+    main.loop = true;
+
+    // --- Emission Module ---
+    var emission = ps.emission;
+    emission.rateOverTime = _emissionRate;
+
+    // --- Shape Module ---
+    var shape = ps.shape;
+    shape.shapeType = ParticleSystemShapeType.Box;
+    shape.scale = new Vector3(_emissionWidth, _emissionHeight, _emissionDepth);
+    shape.position = new Vector3(0f, 0f, _emissionZOffset);  // emit ahead of player
+
+    // Set emission direction: particles spawn and move along -Z (toward player / past player)
+    // startSpeed above is positive magnitude; the shape's rotation or velocity over lifetime
+    // determines direction. We use a negative Z velocity.
+    var velocityOverLifetime = ps.velocityOverLifetime;
+    velocityOverLifetime.enabled = true;
+    velocityOverLifetime.z = -_particleSpeed;       // backward
+
+    // Disable start speed (we control velocity via the module)
+    main.startSpeed = 0f;
+
+    // --- Renderer Module ---
+    var renderer = ps.GetComponent<ParticleSystemRenderer>();
+    renderer.renderMode = ParticleSystemRenderMode.Stretch;  // speed-line stretch effect
+    renderer.lengthScale = 2f;                                // how much to stretch
+    renderer.velocityScale = 0.15f;                           // stretch proportional to velocity
+    renderer.material = _particleMaterial;
+    renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+    renderer.receiveShadows = false;
 }
 ```
 
-**Update**: Each frame, checks:
-- `LeftPressed`: `Keyboard.current?.aKey.wasPressedThisFrame` OR `Keyboard.current?.leftArrowKey.wasPressedThisFrame`
-- `RightPressed`: `Keyboard.current?.dKey.wasPressedThisFrame` OR `Keyboard.current?.rightArrowKey.wasPressedThisFrame`
-- `JumpPressed`: `Keyboard.current?.spaceKey.wasPressedThisFrame` OR `Keyboard.current?.wKey.wasPressedThisFrame` OR `Keyboard.current?.upArrowKey.wasPressedThisFrame`
-- `RestartPressed`: `Keyboard.current?.rKey.wasPressedThisFrame`
-- Touch: `Touchscreen.current` — swipe left/right (horizontal delta > threshold), swipe up (jump), tap (restart when game over). Each device is null-checked.
+**Note on "Stretch" render mode**: `ParticleSystemRenderMode.Stretch` stretches each particle billboard in the direction of its velocity. This produces the classic "speed line" look — thin streaking lines flowing backward past the player. Combine with a white semi-transparent unlit material for the dust/wind effect.
 
-**Design rationale**: All input quirks are localized here. PlayerController never touches `Keyboard.current` directly — it only reads the boolean properties.
+**Alternative simpler approach** (if Stretch isn't available or doesn't look right in the Unity version):
+- Use `ParticleSystemRenderMode.Billboard`
+- Increase `startSize` to 0.1–0.2f
+- The sheer number of particles creates the motion illusion
+
+**Integration in SceneBootstrapper.BuildScene()**:
+```csharp
+// After creating the Player GameObject (step 3 in BuildScene):
+GameObject windGo = new GameObject("WindEffect");
+windGo.transform.SetParent(player.transform, false);
+windGo.transform.localPosition = Vector3.zero;
+windGo.AddComponent<WindEffect>();
+```
 
 ---
 
-### 5. PlayerController (`Assets/Scripts/PlayerController.cs`)
+### 7. SceneBootstrapper (MODIFY)
 
-**Type**: MonoBehaviour. `[RequireComponent(typeof(Rigidbody))]`. Attached to the Player Capsule.
+**File**: `Assets/Scripts/SceneBootstrapper.cs`
 
-**Responsibility**: Auto-run forward movement, lane switching (smooth interpolation), jump, and collision death detection.
+**Changes**:
+1. **Ground scale**: Change Z from `20f` to `200f` (or `100f`) — with a stationary player, this is effectively infinite.
+2. **WindEffect**: Create child GameObject on Player with `WindEffect` component.
+3. **Player starting Z**: Explicitly set to `0f` (currently `new Vector3(0f, 1f, 0f)` — already correct).
 
-**Serialized Fields** (self-supplying with Placeholders fallback):
+**Modified BuildScene() excerpts**:
+
 ```csharp
-[SerializeField] private Material _playerMaterial;       // falls back to blue Placeholders material in Awake
-[SerializeField] private float _laneDistance = 2.5f;      // X offset between lanes
-[SerializeField] private float _laneSwitchSpeed = 12f;    // X interpolation speed
-[SerializeField] private float _jumpForce = 10f;          // upward impulse
-[SerializeField] private float _groundCheckDistance = 1.2f; // raycast length for ground detection
-```
-
-**Runtime State**:
-```csharp
-private InputHandler _input;
-private Rigidbody _rb;
-private GameManager _gm;
-private int _currentLane = 1;     // 0=left, 1=center, 2=right
-private float _targetX;
-private bool _isGrounded;
-private bool _isDead;
-```
-
-**Awake**: `_rb = GetComponent<Rigidbody>()`; `_input = GetComponent<InputHandler>()`. Freeze Rigidbody rotation on all axes. If `_playerMaterial` is null, create placeholder blue material and apply to `GetComponent<MeshRenderer>()`. Find `GameManager.Instance` lazily.
-
-**Update** (input + lane switching):
-- If `_isDead`: return.
-- If `_input.LeftPressed && _currentLane > 0`: `_currentLane--`.
-- If `_input.RightPressed && _currentLane < 2`: `_currentLane++`.
-- `_targetX = (_currentLane - 1) * _laneDistance`.
-- Smoothly move X: `Vector3 pos = transform.position; pos.x = Mathf.Lerp(pos.x, _targetX, _laneSwitchSpeed * Time.deltaTime); transform.position = pos;`.
-- If `_input.JumpPressed && _isGrounded`: `_rb.AddForce(Vector3.up * _jumpForce, ForceMode.Impulse)`.
-- Ground check: `_isGrounded = Physics.Raycast(transform.position, Vector3.down, _groundCheckDistance)`.
-
-**FixedUpdate** (physics movement):
-- If `_isDead`: `_rb.velocity = Vector3.zero`; return.
-- `_rb.velocity = new Vector3(0, _rb.velocity.y, _gm.ForwardSpeed)`.
-  (Note: X is handled in Update via transform, not velocity, to avoid physics fighting the lane interpolation.)
-
-**OnCollisionEnter**: If `collision.gameObject.CompareTag("Obstacle")`: `_isDead = true; _gm.GameOver();` Apply death visual: change material color to red.
-
----
-
-### 6. CameraFollow (`Assets/Scripts/CameraFollow.cs`)
-
-**Type**: MonoBehaviour. Attached to the Main Camera GameObject.
-
-**Responsibility**: Smooth 3D perspective follow of the player capsule from behind and above.
-
-**Serialized Fields**:
-```csharp
-[SerializeField] private Vector3 _offset = new Vector3(0, 5, -8);  // relative to player
-[SerializeField] private float _smoothSpeed = 8f;
-[SerializeField] private float _lookAheadZ = 3f;   // look slightly ahead of player
-```
-
-**Awake**: `_player = GameObject.FindGameObjectWithTag("Player")?.transform`. Camera field of view = 60, near clip = 0.3f, far clip = 100f.
-
-**LateUpdate**: If player exists:
-- Target position = player.position + offset (offset Z is relative so camera trails behind)
-- `transform.position = Vector3.Lerp(transform.position, targetPosition, _smoothSpeed * Time.deltaTime)`
-- `transform.LookAt(player.position + Vector3.forward * _lookAheadZ)`
-
----
-
-### 7. ObstacleSpawner (`Assets/Scripts/ObstacleSpawner.cs`)
-
-**Type**: MonoBehaviour. Attached to its own "ObstacleSpawner" GameObject.
-
-**Responsibility**: Owns the `ObjectPool<GameObject>` for cube obstacles. Spawns obstacles ahead of the player at random intervals and in random lanes.
-
-**Serialized Fields**:
-```csharp
-[SerializeField] private Material _obstacleMaterial;    // falls back to red placeholder
-[SerializeField] private float _spawnDistance = 35f;     // how far ahead to spawn
-[SerializeField] private float _despawnDistance = 10f;   // how far behind player before recycling
-[SerializeField] private float _minSpawnInterval = 0.8f;
-[SerializeField] private float _maxSpawnInterval = 2.0f;
-[SerializeField] private int _poolSize = 25;
-```
-
-**Runtime State**:
-```csharp
-private ObjectPool<GameObject> _pool;
-private Transform _player;
-private float _nextSpawnZ;       // Z position where next obstacle spawns
-private int _lastLane = -1;       // track last lane to avoid repeats (optional)
-```
-
-**Awake**: Find player via tag. Create the pool:
-```csharp
-_pool = new ObjectPool<GameObject>(
-    createFunc: () => {
-        var cube = Placeholders.CreatePrimitive(PrimitiveType.Cube, Color.red, "Obstacle");
-        cube.tag = "Obstacle";
-        cube.AddComponent<Obstacle>();
-        return cube;
-    },
-    actionOnGet: (go) => { go.SetActive(true); },
-    actionOnRelease: (go) => { go.SetActive(false); },
-    actionOnDestroy: (go) => Destroy(go),
-    collectionCheck: false,
-    defaultCapacity: 10,
-    maxSize: _poolSize
+// Step 2: Ground Plane — extend Z scale
+GameObject ground = Placeholders.CreatePrimitive(
+    PrimitiveType.Plane,
+    new Color(0.3f, 0.3f, 0.3f),
+    "Ground"
 );
+ground.transform.position = new Vector3(0f, 0f, 10f);
+ground.transform.localScale = new Vector3(3f, 1f, 200f);  // was 20f → now 200f
+ground.tag = "Ground";
+
+// Step 3: Player Capsule — attach WindEffect
+GameObject player = Placeholders.CreatePrimitive(
+    PrimitiveType.Capsule,
+    Color.blue,
+    "Player"
+);
+player.transform.position = new Vector3(0f, 1f, 0f);  // Z=0, stationary
+player.tag = "Player";
+
+// Rigidbody, InputHandler, PlayerController (unchanged)
+Rigidbody rb = player.AddComponent<Rigidbody>();
+rb.mass = 1f;
+rb.drag = 0f;
+rb.constraints = RigidbodyConstraints.FreezeRotation;
+player.AddComponent<InputHandler>();
+player.AddComponent<PlayerController>();
+
+// WindEffect — NEW: attach as child of player
+GameObject windGo = new GameObject("WindEffect");
+windGo.transform.SetParent(player.transform, false);
+windGo.transform.localPosition = Vector3.zero;
+windGo.AddComponent<WindEffect>();
 ```
 
-**Update** (spawn logic):
-- If `GameManager.Instance.IsGameOver`: return.
-- Spawn obstacles at intervals based on distance: when player reaches `_nextSpawnZ`, spawn one.
-- Randomly select lane (0, 1, 2). Optionally avoid same lane twice in a row.
-- `GameObject obs = _pool.Get()`;
-- Position: `new Vector3((lane - 1) * 2.5f, 0.5f, player.position.z + _spawnDistance)`
-- Set `obs.GetComponent<Obstacle>().Configure(_pool, player)` (pass release callback + player reference)
-- Set `_nextSpawnZ = player.position.z + Random.Range(_minSpawnInterval * _gm.ForwardSpeed, _maxSpawnInterval * _gm.ForwardSpeed)`
-
-**Note on spawn strategy**: Instead of time-based intervals (which cause uneven spacing if the game starts slow), use distance-based spawns: each spawn sets `_nextSpawnZ` some distance ahead. This ensures consistent obstacle density regardless of speed.
+**No other changes to BuildScene()**. Camera, UI, EventSystem, GameManager, ObstacleSpawner, LaneMarkers all remain unchanged.
 
 ---
 
-### 8. Obstacle (`Assets/Scripts/Obstacle.cs`)
+### 8. CameraFollow (NO CHANGE)
 
-**Type**: MonoBehaviour. Attached to each pooled cube by the spawner's `createFunc`.
+**File**: `Assets/Scripts/CameraFollow.cs`
 
-**Responsibility**: Scroll toward the player each frame. Detect when it has passed the player and return itself to the pool.
-
-**Fields**:
-```csharp
-private float _scrollSpeed;        // matches GameManager.ForwardSpeed
-private Transform _player;
-private System.Action<GameObject> _releaseAction;
-```
-
-**Configure(ObjectPool<GameObject> pool, Transform player)**:
-```csharp
-public void Configure(UnityEngine.Pool.ObjectPool<GameObject> pool, Transform player)
-{
-    _player = player;
-    _releaseAction = (go) => pool.Release(go);
-    _scrollSpeed = GameManager.Instance.ForwardSpeed;
-}
-```
-
-**Update**:
-- `transform.position += Vector3.back * _scrollSpeed * Time.deltaTime;`
-- If `transform.position.z < _player.position.z - 10f`: `_releaseAction?.Invoke(gameObject);`
+**No changes needed.** With the player at fixed Z=0, the camera's target position `_player.position + _offset` (where `_offset.z = -8f`) stays at Z=-8. The `LookAt` with `_lookAheadZ` still looks slightly ahead of the player along +Z. No jitter — the Z component is constant.
 
 ---
 
-### 9. UIManager (`Assets/Scripts/UIManager.cs`)
+### 9. InputHandler (NO CHANGE)
 
-**Type**: MonoBehaviour. Attached to the "UI" Canvas GameObject.
+**File**: `Assets/Scripts/InputHandler.cs`
 
-**Responsibility**: Display running distance score, show/hide Game Over panel with restart prompt.
-
-**Serialized Fields** (assigned by bootstrapper in BuildScene):
-```csharp
-[SerializeField] private TextMeshProUGUI _scoreText;
-[SerializeField] private GameObject _gameOverPanel;
-[SerializeField] private TextMeshProUGUI _gameOverScoreText;
-```
-
-**Start**: Subscribe to `GameManager.Instance.OnGameOver += ShowGameOver; GameManager.Instance.OnRestart += HideGameOver;`. Panel starts inactive.
-
-**Update**: If game is playing, `_scoreText.text = $"Distance: {GameManager.Instance.Distance:F0}m"`.
-
-**ShowGameOver()**: `_gameOverPanel.SetActive(true); _gameOverScoreText.text = $"Game Over!\nDistance: {GameManager.Instance.Distance:F0}m\nPress R to restart";`
-
-**HideGameOver()**: `_gameOverPanel.SetActive(false);`
-
-The `_scoreText` and `_gameOverPanel` fields use the self-supplying pattern: if the bootstrapper doesn't assign them (e.g., after bake and manual edits), the component logs a warning but doesn't crash.
+**No changes needed.** Lane switching, jumping, and restart input are unaffected by the stationary-player refactor.
 
 ---
 
-### 10. SceneBaker (`Assets/Editor/SceneBaker.cs`)
+### 10. Placeholders (NO CHANGE)
 
-**Type**: Editor-only script (`#if UNITY_EDITOR`). Static class with `[MenuItem]`.
+**File**: `Assets/Scripts/Placeholders.cs`
 
-**Responsibility**: Calls `SceneBootstrapper.BuildScene()` in Edit mode to persist GameObjects into the scene hierarchy for manual asset replacement and saving.
+**No changes needed.** `CreateMaterial()` already handles the white semi-transparent material for `WindEffect`. The shader fallback chain (URP Lit → Standard → Unlit/Color) works for particles.
 
-**Menu path**: `Tools > Bake Scene to Hierarchy`
+---
 
-**Flow**:
-1. Validate `!Application.isPlaying` (show dialog if in Play mode).
-2. Create a temporary GameObject named "___Baker".
-3. Add `SceneBootstrapper` component to it. Set its `_buildOnAwake = false`.
-4. Call `bootstrapper.BuildScene()`.
-5. Destroy the temporary "___Baker" GameObject.
-6. Mark scene dirty: `EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene())`.
-7. Log success: "Scene baked. Save the scene (Ctrl+S) to persist."
+### 11. SceneBaker (NO CHANGE)
 
-**Important**: Because `BuildScene()` runs in Edit mode, `GameObject.CreatePrimitive()`, `new GameObject()`, and all component additions produce persistent objects. The user then saves the scene manually (or we prompt them to). The bootstrapper is destroyed so it doesn't re-build on Play.
+**File**: `Assets/Editor/SceneBaker.cs`
+
+**No changes needed.** Calls `BuildScene()` which now creates the WindEffect and larger ground automatically.
+
+---
+
+## Component Interaction Matrix
+
+| From → To | Game Manager | Player Controller | Obstacle Spawner | Obstacle | UI Manager | Wind Effect | Camera Follow | Input Handler |
+|------------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **GameManager** | — | — | — | — | events | — | — | — |
+| **PlayerController** | `.Instance.IsGameOver` `.GameOver()` | — | — | — | — | — | — | reads `.LeftPressed` etc. |
+| **ObstacleSpawner** | `.Instance.IsGameOver` `.Instance.ForwardSpeed` | `.position.z` (for spawn pos) | — | `.Configure()` | — | — | — | — |
+| **Obstacle** | `.Instance.ForwardSpeed` (cached) | `.position.z` (despawn check) | — | — | — | — | — | — |
+| **UIManager** | `.Instance.Distance` `.OnGameOver` `.OnRestart` | — | — | — | — | — | — | `.RestartPressed` |
+| **WindEffect** | `.Instance.ForwardSpeed` (fallback) | — | — | — | — | — | — | — |
+| **CameraFollow** | — | `.position` (follow target) | — | — | — | — | — | — |
 
 ---
 
 ## Technical Stack
 
 | Concern | Technology | Rationale |
-|---|---|---|
-| Engine | Unity 6 (6000.0+) | Latest LTS, required by architect directive |
+|---------|-----------|-----------|
+| Engine | Unity 6 (6000.0+) | Required by project brief |
 | Language | C# (pure scripts) | Project constraint |
-| Rendering | URP (Universal Render Pipeline) | Default modern pipeline in Unity 6; fallback to Built-in |
+| Rendering | URP (fallback to Built-in) | Placeholders shader chain handles both |
 | Visuals | `GameObject.CreatePrimitive()` + runtime Materials | Zero assets; Placeholders utility |
-| Physics | `Rigidbody` + `OnCollisionEnter` | Simple, built-in gravity + collision |
-| Input | `UnityEngine.InputSystem` (direct C# device queries) | New Input System, no .inputactions assets |
-| UI | `UnityEngine.UI.Canvas` + `TextMeshProUGUI` (TMP) | TMP included in Unity 6 by default |
-| Pooling | `UnityEngine.Pool.ObjectPool<GameObject>` | Built-in, zero allocation after warm-up |
-| Scene composition | `SceneBootstrapper.BuildScene()` | Single source of truth; Play + Bake |
-| Editor Bake | `[MenuItem]` + `EditorSceneManager` | Standard Unity Editor scripting |
+| Wind effect | `ParticleSystem` (code-configured) | Built-in, no assets; `Stretch` render mode for speed lines |
+| Physics | `Rigidbody` + `OnCollisionEnter` | Built-in gravity + collision detection |
+| Input | `UnityEngine.InputSystem` (direct C# polling) | Cross-platform; no .inputactions assets |
+| UI | Canvas + `TextMeshProUGUI` (TMP) | TMP included in Unity 6 by default |
+| Pooling | `UnityEngine.Pool.ObjectPool<GameObject>` | Built-in, zero-GC after warm-up |
+| Scene build | `SceneBootstrapper.BuildScene()` | Single source of truth for Play + Bake |
+| Bake | `[MenuItem]` + `EditorSceneManager` | Standard Unity Editor scripting |
 
 ---
 
-## Key Design Decisions & Rationale
+## Bug Fix Traceability
 
-1. **New Input System without .inputactions**: The architect requires the new Input System (`UnityEngine.InputSystem`) for cross-platform compatibility. We use direct C# device queries (`Keyboard.current?.aKey.wasPressedThisFrame`) instead of `.inputactions` assets, keeping the project pure-C#. Null-conditional operators guard against missing devices.
-
-2. **TMP over Legacy Text**: Unity 6 includes TextMeshPro as a built-in package. TMP provides superior text rendering and is the modern standard. The default LiberationSans SDF font asset is loaded via `Resources.Load<TMP_FontAsset>()` without any asset imports.
-
-3. **Rigidbody for forward movement + Transform for lane switching**: `Rigidbody.velocity.z` handles auto-run (physics-correct), `Rigidbody.AddForce` handles jump (natural gravity arc), and `Transform.position.x` handles lane switching (smooth interpolation without physics fighting). This hybrid approach is pragmatic and common in Unity arcade games.
-
-4. **Distance-based obstacle spawning**: Instead of time-based intervals, obstacles spawn when the player crosses a distance threshold (`_nextSpawnZ`). This ensures consistent obstacle density regardless of GameManager speed changes (future-proof).
-
-5. **Singleton GameManager with explicit execution order**: `[DefaultExecutionOrder(-100)]` guarantees GameManager.Awake runs before all other components, eliminating Awake-order bugs in both Play mode and baked scenes.
-
-6. **Self-supplying [SerializeField] pattern**: Every visual component exposes `[SerializeField]` fields for materials/fonts and falls back to `Placeholders` in `Awake` if null. This means the bootstrapper doesn't need to inject every reference — and after Bake, users can drag real assets into Inspector slots.
+| Bug | Root Cause | Fix | File(s) Changed |
+|-----|-----------|-----|-----------------|
+| **#1: Distance frozen in bake mode** | UIManager.Start() may run before GameManager singleton is set in baked scenes → events not subscribed → score never updates in UI | Add lazy `TrySubscribeEvents()` called from `Update()` until subscription succeeds | `UIManager.cs` |
+| **#2: No obstacle spawning in bake mode** | Stationary player at Z=0 → `_player.position.z >= _nextSpawnZ` never fires (since Z never increases past 20f threshold) | Replace `_player.position.z` with virtual `_scrollDistance` counter in spawn trigger | `ObstacleSpawner.cs` |
+| **#3: Player falls off runway** | Player auto-runs at 8 units/sec on a ground plane scaled Z=20 (200 units of ground from Z=0 to Z=40) → falls off after ~13 seconds | Remove Z velocity from PlayerController (player stays at Z=0) + scale ground Z to 200 for visual safety margin | `PlayerController.cs`, `SceneBootstrapper.cs` |
+| **Motion feel (UX)** | Stationary player feels static without visual cues | Add WindEffect child with code-driven ParticleSystem speed lines | `WindEffect.cs` (new), `SceneBootstrapper.cs` |
 
 ---
 
 ## Edge Cases Addressed
 
-| Edge Case | Mitigation |
-|---|---|
-| SceneBootstrapper double-build | `_sceneBuilt` static flag + `FindObjectOfType<GameManager>() != null` guard |
-| Bake during Play mode | `SceneBaker` checks `Application.isPlaying` and aborts with warning dialog |
-| Object pool exhaustion | `maxSize = 25`, spawner throttles; `collectionCheck = false` for perf |
-| Two obstacles in same lane consecutively | Spawner tracks `_lastLane` and avoids it (optional, configurable) |
-| Collision with ground triggers death | Only `collision.gameObject.CompareTag("Obstacle")` triggers death |
-| Canvas doesn't render | Bootstrapper creates `EventSystem` if missing; `CanvasScaler` set to `ScaleWithScreenSize` |
-| Player slides on ground | Rigidbody constraints freeze X/Z (except during lane switch via transform) |
-| Player tumbles after jump | `RigidbodyConstraints.FreezeRotation` on all axes |
-| Camera aspect ratio | FOV = 60 works for 16:9; `CanvasScaler` handles UI |
-| TMP default font missing | Graceful fallback: if `Resources.Load<TMP_FontAsset>` fails, use `TMP_Settings.defaultFontAsset` |
-| Player falls through ground | Ground has `MeshCollider` (from `CreatePrimitive(Plane)`); player has `CapsuleCollider` |
-| Restart: duplicate singletons | `SceneManager.LoadScene` destroys everything; `Awake` singleton guard handles edge case |
+| Edge Case | Mitigation | File |
+|-----------|-----------|------|
+| UIManager.Start() races with GameManager singleton in baked scene | Lazy retry in `Update()` via `TrySubscribeEvents()` | `UIManager.cs` |
+| Obstacle spawning never fires with stationary player | Virtual `_scrollDistance` decoupled from player position | `ObstacleSpawner.cs` |
+| Player falls off finite ground | Player Z velocity = 0; ground Z scale = 200+ | `PlayerController.cs`, `SceneBootstrapper.cs` |
+| Wind particles follow player during lane switch | `simulationSpace = World` so particles stay in world space | `WindEffect.cs` |
+| WindEffect material is null | Self-supplying fallback to white semi-transparent Placeholders material | `WindEffect.cs` |
+| ParticleSystem Stretch render mode not available on older Unity | Fallback: Billboard mode + increased particle count/size | `WindEffect.cs` |
+| Ground texture UV stretching (future-proofing) | Not an issue with solid-color placeholder; documented in RESOURCES.md | `RESOURCES.md` |
+| Obstacles spawn behind player on first spawn | `_nextSpawnZ` initial = 0f so first obstacle spawns immediately at player.z + _spawnDistance = 35f | `ObstacleSpawner.cs` |
+| Restart with stationary player | `SceneManager.LoadScene` reloads scene; GameManager.Awake() resets Distance and IsGameOver | `GameManager.cs` |
+| Double subscription if TrySubscribeEvents runs multiple times | Guard flag `_eventsSubscribed` prevents re-subscription | `UIManager.cs` |
+| Wind particles continue emitting after GameOver | ParticleSystem auto-plays; acceptable — particles don't affect gameplay. Could stop on GameOver via event subscription (future enhancement) | `WindEffect.cs` |
 
 ---
 
-## Extensibility Points (future, not implemented now)
+## Extensibility Points (Future, Not Implemented Now)
 
-- **Difficulty scaling**: `GameManager.ForwardSpeed` can increase over time (currently constant 8f).
-- **Obstacle variety**: `ObstacleSpawner` can pool multiple obstacle types (tall cubes, wide barriers spanning 2 lanes).
-- **Collectibles**: Add a second `ObjectPool` for coin Spheres in `ObstacleSpawner`.
-- **Visual themes**: Replace `Placeholders.CreateMaterial` calls with real materials via Inspector after Bake.
-- **Mobile controls**: `InputHandler` already queries `Touchscreen.current` — just needs swipe detection thresholds.
+- **WindEffect stops on death**: Subscribe `WindEffect` to `GameManager.OnGameOver` to stop/clear particles when the run ends.
+- **Scroll speed increase over time**: Modify `GameManager.ForwardSpeed` to gradually increase; `ObstacleSpawner._scrollDistance` and `WindEffect._particleSpeed` read `ForwardSpeed` each frame so they'd automatically accelerate.
+- **Multiple wind layers**: Add a second `WindEffect` child with different particle size/color for a parallax dust effect.
+- **Obstacle variety**: `ObstacleSpawner` can pool multiple obstacle types via separate `ObjectPool` instances.
 
 ---
 
 ## Linter Manifest
 
-Only `.cs` files in this project. C# compilation is handled automatically by the Unity build system, so no additional linters are needed.
+Only `.cs` files in this project. C# compilation is handled automatically by the Unity build system. The `linter_manifest.json` covers markdown documentation only.
 
-## RESOURCES.md Deliverable
+## RESOURCES.md Update Notes
 
-`RESOURCES.md` will be written as part of implementation and must cover:
-- Unity version requirement (6000.0+)
-- Required UPM packages (Input System — included by default; TextMeshPro — included by default)
-- How to swap placeholder materials for real art (Inspector fields on each component)
-- How to use the Bake menu to persist the scene for editing
-- How to create prefabs from baked GameObjects
+The existing `RESOURCES.md` must be updated to:
+1. Document the new `WindEffect` component's `_particleMaterial` field — users can replace the white semi-transparent placeholder with a custom particle material.
+2. Note that player is now stationary (Z velocity = 0) and ground is larger.
+3. All other sections remain valid.
