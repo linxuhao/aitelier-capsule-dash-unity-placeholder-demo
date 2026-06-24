@@ -37,7 +37,7 @@ Both packages are **included by default** in Unity 2022.3+ and Unity 6. No manua
 
 The bootstrapper will:
 - Set physics gravity
-- Create the ground plane, player capsule, camera, UI canvas, EventSystem, GameManager, ObstacleSpawner, and lane markers
+- Create the ground plane, player capsule, camera, UI canvas, EventSystem, GameManager, ObstacleSpawner, lane markers, and WindEffect
 - Wire all components together
 - Destroy itself after building
 
@@ -63,6 +63,14 @@ All visual components use the **self-supplying SerializeField pattern**: they ex
 | `CameraFollow` | `_offset`, `_smoothSpeed`, `_lookAheadZ` | Configurable | Tweak camera position / feel |
 | `UIManager` | `_scoreText`, `_gameOverPanel`, `_gameOverScoreText` | Self-discovered via GameObject.Find | Assign TMP texts / panel directly |
 | `PlayerController` | `_laneDistance`, `_laneSwitchSpeed`, `_jumpForce`, `_groundCheckDistance` | Configurable | Tweak gameplay feel |
+| `WindEffect` | `_particleMaterial` | White semi-transparent (`Color(1,1,1,0.4)`) | Your particle material |
+
+> **Important — Player-Stationary Refactor**: The player capsule is now **stationary on the Z axis** (obstacles scroll toward the player instead of the player running forward). The `PlayerController` sets Z velocity to `0` every frame, so the player never moves forward. This means:
+> - The player **never falls off the runway** — they remain at `Z=0` permanently.
+> - **Ground scaling**: The ground plane Z scale is set to `200` (was `20`), providing effectively infinite runway space even before the stationary fix.
+> - **WindEffect**: A code-driven `ParticleSystem` (attached as a child of the Player) emits speed lines flowing backward past the player, visually conveying forward motion.
+> - **Obstacle spawning**: The `ObstacleSpawner` uses a virtual scroll distance counter (not the player's Z position) to trigger spawns, so obstacles continue to appear correctly.
+> - **Distance scoring**: The `GameManager` continues to accumulate distance using `ForwardSpeed * Time.deltaTime` (survival-time-based), producing the familiar "meters" display in the UI.
 
 ## Tools Menu: Bake Scene to Hierarchy
 
@@ -116,9 +124,10 @@ Assets/
     Obstacle.cs             — Per-obstacle scroll & pool return
     ObstacleSpawner.cs      — Object pool, spawn logic, lane selection
     Placeholders.cs         — Runtime primitive + material creation
-    PlayerController.cs     — Auto-run, lane switch, jump, collision death
+    PlayerController.cs     — Stationary player (Z velocity = 0), lane switch, jump, collision death
     SceneBootstrapper.cs    — Scene construction (Awake + Bake)
     UIManager.cs            — Score display, Game Over panel
+    WindEffect.cs           — Code-driven particle speed lines for wind/motion effect
   Editor/
     SceneBaker.cs           — [MenuItem] Tools > Bake Scene to Hierarchy
 ```

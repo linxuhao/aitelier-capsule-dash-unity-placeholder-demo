@@ -67,7 +67,10 @@ public class SceneBootstrapper : MonoBehaviour
             "Ground"
         );
         ground.transform.position = new Vector3(0f, 0f, 10f);
-        ground.transform.localScale = new Vector3(3f, 1f, 20f);
+        // Z=200 extends the plane far enough that a stationary player never falls off.
+        // With the player-stationary refactor, the player stays at Z=0 while obstacles
+        // scroll toward them — so ground only needs to exist around the player area.
+        ground.transform.localScale = new Vector3(3f, 1f, 200f);
         ground.tag = "Ground";
 
         // --- 3. Player Capsule ---
@@ -79,7 +82,8 @@ public class SceneBootstrapper : MonoBehaviour
         player.transform.position = new Vector3(0f, 1f, 0f);
         player.tag = "Player";
 
-        // Rigidbody for physics-based auto-run and jumping
+        // Rigidbody for physics-based jumping and lane switching (no forward auto-run;
+        // the stationary-player refactor sets Z velocity to 0 in PlayerController)
         Rigidbody rb = player.AddComponent<Rigidbody>();
         rb.mass = 1f;
         rb.drag = 0f;
@@ -88,6 +92,13 @@ public class SceneBootstrapper : MonoBehaviour
         // Input and control components
         player.AddComponent<InputHandler>();
         player.AddComponent<PlayerController>();
+
+        // WindEffect — child GameObject with code-driven particle speed lines that
+        // visually convey forward motion while the player is stationary at Z=0.
+        GameObject windGo = new GameObject("WindEffect");
+        windGo.transform.SetParent(player.transform, false);
+        windGo.transform.localPosition = Vector3.zero;
+        windGo.AddComponent<WindEffect>();
 
         // --- 4. Main Camera ---
         // Use existing MainCamera if present; otherwise create one
