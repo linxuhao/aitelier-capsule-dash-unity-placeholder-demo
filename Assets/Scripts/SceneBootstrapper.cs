@@ -86,7 +86,7 @@ public class SceneBootstrapper : MonoBehaviour
         // the stationary-player refactor sets Z velocity to 0 in PlayerController)
         Rigidbody rb = player.AddComponent<Rigidbody>();
         rb.mass = 1f;
-        rb.drag = 0f;
+        rb.linearDamping = 0f;
         rb.constraints = RigidbodyConstraints.FreezeRotation;
 
         // Input and control components

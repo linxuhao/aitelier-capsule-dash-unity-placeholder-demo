@@ -100,7 +100,7 @@ public class PlayerController : MonoBehaviour
 
         // Configure Rigidbody for physics movement
         _rb.mass = 1f;
-        _rb.drag = 0f;
+        _rb.linearDamping = 0f;
         _rb.useGravity = true;
         _rb.constraints = RigidbodyConstraints.FreezeRotation;
 
@@ -169,7 +169,7 @@ public class PlayerController : MonoBehaviour
         // Suppress physics movement after death
         if (_isDead)
         {
-            _rb.velocity = Vector3.zero;
+            _rb.linearVelocity = Vector3.zero;
             return;
         }
 
