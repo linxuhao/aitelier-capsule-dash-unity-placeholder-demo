@@ -104,6 +104,13 @@ public class PlayerController : MonoBehaviour
         _rb.useGravity = true;
         _rb.constraints = RigidbodyConstraints.FreezeRotation;
 
+        // Enable Continuous Dynamic CCD to prevent fast-moving obstacles (static
+        // colliders at 8 units/s via Transform) from tunneling through the player
+        // between physics frames (bullet-through-paper effect). This is the root
+        // cause of the obstacle collision death bug — the OnCollisionEnter logic
+        // itself was correct, but discrete detection missed collisions at speed.
+        _rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
+
         // Self-supply material if not assigned in Inspector
         MeshRenderer renderer = GetComponent<MeshRenderer>();
         if (_playerMaterial == null && renderer != null)
@@ -185,6 +192,10 @@ public class PlayerController : MonoBehaviour
 
     private void OnCollisionEnter(Collision collision)
     {
+        // Debug log to verify collision detection is firing (temporary aid).
+        // Remove after confirming death works correctly.
+        Debug.Log($"Player.OnCollisionEnter: collided with '{collision.gameObject.name}' (tag={collision.gameObject.tag})");
+
         // Ignore collisions after death (prevents double-trigger)
         if (_isDead)
             return;
