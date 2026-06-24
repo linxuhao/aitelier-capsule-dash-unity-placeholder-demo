@@ -74,7 +74,7 @@ public class InputHandler : MonoBehaviour
     /// <param name="touchscreen">The active Touchscreen device (guaranteed non-null by caller).</param>
     private void ProcessTouch(Touchscreen touchscreen)
     {
-        TouchState touch = touchscreen.primaryTouch;
+        var touch = touchscreen.primaryTouch;   // TouchControl (primaryTouch is not a TouchState)
 
         switch (touch.phase.ReadValue())
         {
