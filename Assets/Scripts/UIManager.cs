@@ -8,8 +8,13 @@ using TMPro;
 /// Attached to the "UI" Canvas GameObject by SceneBootstrapper.BuildScene().
 ///
 /// Subscribes to GameManager.OnGameOver and GameManager.OnRestart events to
-/// show/hide the Game Over panel. Polls InputHandler.RestartPressed (via
-/// FindObjectOfType) to detect restart input when the game is over.
+/// show/hide the Game Over panel. Uses a lazy re-subscription pattern
+/// (TrySubscribeEvents) that retries each frame until subscription succeeds,
+/// handling the edge case where GameManager.Instance is momentarily null
+/// during Start() in baked scenes.
+///
+/// Polls InputHandler.RestartPressed (via FindObjectOfType) to detect restart
+/// input when the game is over.
 ///
 /// Uses the self-supplying SerializeField pattern: fields can be assigned by
 /// the bootstrapper or discovered via GameObject.Find in Start().
@@ -46,6 +51,13 @@ public class UIManager : MonoBehaviour
     /// </summary>
     private InputHandler _inputHandler;
 
+    /// <summary>
+    /// Guard flag indicating whether GameManager events have been successfully
+    /// subscribed. Defaults to false. Set to true in TrySubscribeEvents() once
+    /// subscription completes. Resets to false on scene load (new UIManager instance).
+    /// </summary>
+    private bool _eventsSubscribed;
+
     // --- Unity Lifecycle ---
 
     private void Start()
@@ -77,17 +89,9 @@ public class UIManager : MonoBehaviour
         // Detect an InputHandler in the scene for restart polling
         _inputHandler = FindObjectOfType<InputHandler>();
 
-        // Subscribe to GameManager events
-        if (GameManager.Instance != null)
-        {
-            GameManager.Instance.OnGameOver += ShowGameOver;
-            GameManager.Instance.OnRestart += HideGameOver;
-        }
-        else
-        {
-            Debug.LogWarning("UIManager.Start: GameManager.Instance is null. " +
-                             "Events will not be subscribed. Ensure GameManager exists.");
-        }
+        // Attempt event subscription (may fail if GameManager is not yet ready
+        // in baked scenes — Update() will retry each frame until it succeeds).
+        TrySubscribeEvents();
 
         // Start with the Game Over panel hidden
         if (_gameOverPanel != null)
@@ -98,6 +102,14 @@ public class UIManager : MonoBehaviour
 
     private void Update()
     {
+        // Lazy re-subscription: if events weren't subscribed in Start()
+        // (e.g., GameManager.Instance was null during Start in a baked scene),
+        // retry each frame until subscription succeeds.
+        if (!_eventsSubscribed)
+        {
+            TrySubscribeEvents();
+        }
+
         // Guard: ensure GameManager exists
         if (GameManager.Instance == null)
         {
@@ -123,6 +135,37 @@ public class UIManager : MonoBehaviour
         {
             GameManager.Instance.OnGameOver -= ShowGameOver;
             GameManager.Instance.OnRestart -= HideGameOver;
+        }
+    }
+
+    // --- Event Subscription ---
+
+    /// <summary>
+    /// Idempotent event subscription method. Attempts to subscribe to
+    /// GameManager.OnGameOver and GameManager.OnRestart if not yet subscribed.
+    /// Returns immediately if already subscribed or if GameManager.Instance
+    /// is null. Logs a warning when the singleton is unavailable so developers
+    /// are informed of ordering issues.
+    ///
+    /// Designed to be called from Start() and re-called from Update() in a
+    /// lazy retry pattern, ensuring subscription succeeds even when
+    /// GameManager.Instance is momentarily null during Start() in baked scenes.
+    /// </summary>
+    private void TrySubscribeEvents()
+    {
+        if (_eventsSubscribed)
+            return;
+
+        if (GameManager.Instance != null)
+        {
+            GameManager.Instance.OnGameOver += ShowGameOver;
+            GameManager.Instance.OnRestart += HideGameOver;
+            _eventsSubscribed = true;
+        }
+        else
+        {
+            Debug.LogWarning("UIManager.TrySubscribeEvents: GameManager.Instance is null. " +
+                             "Retrying on next frame. Ensure GameManager component exists in the scene.");
         }
     }
 
