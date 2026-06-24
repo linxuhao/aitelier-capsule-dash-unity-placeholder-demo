@@ -2,9 +2,12 @@ using UnityEngine;
 
 /// <summary>
 /// Controls the player capsule character in the 3D endless runner.
-/// Handles auto-run forward (Rigidbody velocity on Z axis), three-lane switching
-/// (smooth X interpolation via Transform, not physics), jumping (Rigidbody impulse),
-/// ground detection (raycast), and collision death detection.
+/// Handles three-lane switching (smooth X interpolation via Transform, not physics),
+/// jumping (Rigidbody impulse), ground detection (raycast), and collision death detection.
+///
+/// The player is stationary on Z (never auto-runs forward) — obstacles scroll toward
+/// the player instead. This fixes the finite-runway bug (#3) where the player would
+/// fall off the edge of the ground plane.
 ///
 /// Input is consumed from the sibling InputHandler component. Game state queries
 /// and death notification go through GameManager.Instance.
@@ -57,7 +60,8 @@ public class PlayerController : MonoBehaviour
 
     /// <summary>
     /// Reference to the Rigidbody component, resolved in Awake.
-    /// Used for auto-run velocity (Z) and jump impulse (Y).
+    /// Used for jump impulse (Y) and lane-switch suppression.
+    /// Z velocity is explicitly set to 0 — player is stationary on the run axis.
     /// </summary>
     private Rigidbody _rb;
 
@@ -94,7 +98,7 @@ public class PlayerController : MonoBehaviour
         _rb = GetComponent<Rigidbody>();
         _input = GetComponent<InputHandler>();
 
-        // Configure Rigidbody for auto-run physics
+        // Configure Rigidbody for physics movement
         _rb.mass = 1f;
         _rb.drag = 0f;
         _rb.useGravity = true;
@@ -169,14 +173,14 @@ public class PlayerController : MonoBehaviour
             return;
         }
 
-        // Auto-run forward: set Z velocity to GameManager.ForwardSpeed.
+        // Player is stationary on Z — obstacles scroll toward the player instead.
+        // Z velocity is explicitly 0f so no auto-run moves the player forward.
         // Y velocity is preserved for gravity/jump arc.
         // X velocity is zero — lane switching is handled via Transform in Update.
-        float forwardSpeed = GameManager.Instance != null
-            ? GameManager.Instance.ForwardSpeed
-            : 8f;
+        // The forwardSpeed lookup is retained (though unused for velocity) to
+        // minimise the diff footprint and preserve the GameManager.Instance guard.
 
-        _rb.velocity = new Vector3(0f, _rb.velocity.y, forwardSpeed);
+        _rb.velocity = new Vector3(0f, _rb.velocity.y, 0f);
     }
 
     private void OnCollisionEnter(Collision collision)
