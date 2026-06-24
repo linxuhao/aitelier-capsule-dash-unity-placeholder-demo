@@ -12,6 +12,11 @@ using UnityEngine;
 /// the player, flowing backward (along -Z) in world space. This produces the
 /// appearance of speed lines / dust rushing past a moving character.
 ///
+/// Enhanced with three additional ParticleSystem modules:
+/// - ColorOverLifetime: smooth alpha fade-in at birth, fade-out near death
+/// - SizeOverLifetime: particles swell as they pass by, then shrink
+/// - Trails (PerParticle mode): fading speed-line streaks behind each particle
+///
 /// Attached as a child GameObject of the Player by SceneBootstrapper.BuildScene().
 /// No Update() loop required — the ParticleSystem auto-emits with playOnAwake
 /// and loop = true.
@@ -102,6 +107,9 @@ public class WindEffect : MonoBehaviour
     /// - Emission: constant stream at _emissionRate particles per second.
     /// - Shape: box volume positioned ahead of the player.
     /// - VelocityOverLifetime: particles flow backward along -Z at _particleSpeed.
+    /// - ColorOverLifetime: alpha gradient fading in at birth, out near death.
+    /// - SizeOverLifetime: particles swell then shrink for natural streak look.
+    /// - Trails (PerParticle): fading speed-line streaks behind each particle.
     /// - Renderer: stretched billboard mode for speed-line appearance.
     ///
     /// Module structs are cached in local variables before modification, as
@@ -136,7 +144,76 @@ public class WindEffect : MonoBehaviour
         velocityOverLifetime.enabled = true;
         velocityOverLifetime.z = -_particleSpeed;
 
-        // ---- Renderer Module ----
+        // ---- Color Over Lifetime Module (NEW) ----
+        // Fade particles in at birth and out near death for smooth alpha transitions.
+        // Gradient: alpha 0 at 0% -> 0.5 at 40% -> 0.5 at 60% -> 0 at 100%
+        var colorOverLifetime = ps.colorOverLifetime;
+        colorOverLifetime.enabled = true;
+        Gradient colorGradient = new Gradient();
+        colorGradient.SetKeys(
+            new GradientColorKey[]
+            {
+                new GradientColorKey(Color.white, 0f),
+                new GradientColorKey(Color.white, 1f)
+            },
+            new GradientAlphaKey[]
+            {
+                new GradientAlphaKey(0f,   0.0f),
+                new GradientAlphaKey(0.5f, 0.4f),
+                new GradientAlphaKey(0.5f, 0.6f),
+                new GradientAlphaKey(0f,   1.0f)
+            }
+        );
+        colorOverLifetime.color = new ParticleSystem.MinMaxGradient(colorGradient);
+
+        // ---- Size Over Lifetime Module (NEW) ----
+        // Grow particles after birth, then shrink before death.
+        // Creates a natural "streak" appearance: particles swell as they pass by.
+        var sizeOverLifetime = ps.sizeOverLifetime;
+        sizeOverLifetime.enabled = true;
+        AnimationCurve sizeCurve = new AnimationCurve(
+            new Keyframe(0f,   0.02f),
+            new Keyframe(0.3f, 0.08f),
+            new Keyframe(0.7f, 0.08f),
+            new Keyframe(1f,   0.02f)
+        );
+        sizeOverLifetime.size = new ParticleSystem.MinMaxCurve(1f, sizeCurve);
+
+        // ---- Trails Module (NEW) — PRIMARY ENHANCEMENT ----
+        // PerParticle trails produce fading streaks behind each particle,
+        // creating realistic speed-line visuals that convincingly convey
+        // forward motion past a stationary player.
+        // Do NOT use Ribbon mode (ParticleSystemTrailMode.Ribbon) — it has a known
+        // Unity bug with incorrect indexing above 31 particles.
+        var trails = ps.trails;
+        trails.enabled = true;
+        trails.mode = ParticleSystemTrailMode.PerParticle;
+        trails.lifetime = 0.3f;
+
+        AnimationCurve trailWidthCurve = new AnimationCurve(
+            new Keyframe(0f, 0.02f),
+            new Keyframe(0.5f, 0.08f),
+            new Keyframe(1f, 0.01f)
+        );
+        trails.widthOverTrail = new ParticleSystem.MinMaxCurve(1f, trailWidthCurve);
+
+        Gradient trailColorGradient = new Gradient();
+        trailColorGradient.SetKeys(
+            new GradientColorKey[]
+            {
+                new GradientColorKey(Color.white, 0f),
+                new GradientColorKey(Color.white, 1f)
+            },
+            new GradientAlphaKey[]
+            {
+                new GradientAlphaKey(0.3f, 0f),
+                new GradientAlphaKey(0f,   1f)
+            }
+        );
+        trails.colorOverTrail = new ParticleSystem.MinMaxGradient(trailColorGradient);
+        trails.ratio = 1.0f;
+
+        // ---- Renderer Module (existing) ----
         var renderer = ps.GetComponent<ParticleSystemRenderer>();
         renderer.renderMode = ParticleSystemRenderMode.Stretch; // Speed-line stretching
         renderer.lengthScale = 2f;      // Base stretch length
