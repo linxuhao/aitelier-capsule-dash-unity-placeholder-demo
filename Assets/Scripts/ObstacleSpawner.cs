@@ -152,15 +152,20 @@ public class ObstacleSpawner : MonoBehaviour
 
     /// <summary>
     /// Factory method called by the ObjectPool when a new obstacle is needed.
-    /// Creates a red cube primitive, tags it as "Obstacle", and adds the Obstacle
-    /// component for per-frame scroll and pool-return logic.
+    /// Creates a red cube primitive, adds the Obstacle component for per-frame
+    /// scroll and pool-return logic.
+    ///
+    /// Note: The Unity tag "Obstacle" is intentionally NOT set on the cube.
+    /// Collision detection in PlayerController uses component-based detection
+    /// (GetComponent<Obstacle>()) instead of CompareTag("Obstacle"), so the
+    /// tag is unnecessary and would generate a "Tag: Obstacle is not defined"
+    /// console error since the tag is not registered in TagManager.asset.
     /// </summary>
     /// <returns>A new pooled obstacle GameObject.</returns>
     private GameObject CreateObstacle()
     {
         Color color = _obstacleMaterial != null ? _obstacleMaterial.color : Color.red;
         GameObject cube = Placeholders.CreatePrimitive(PrimitiveType.Cube, color, "Obstacle");
-        cube.tag = "Obstacle";
         cube.AddComponent<Obstacle>();
         return cube;
     }

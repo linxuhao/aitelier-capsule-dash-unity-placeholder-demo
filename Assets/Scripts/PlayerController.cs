@@ -200,8 +200,12 @@ public class PlayerController : MonoBehaviour
         if (_isDead)
             return;
 
-        // Only obstacles trigger death — ground, walls, and lane markers do not
-        if (collision.gameObject.CompareTag("Obstacle"))
+        // Only obstacles trigger death — ground, walls, and lane markers do not.
+        // Uses component-based detection (GetComponent<Obstacle>) instead of
+        // CompareTag("Obstacle") because the "Obstacle" tag is not registered
+        // in TagManager.asset. Every obstacle cube already has the Obstacle
+        // component attached by ObstacleSpawner.CreateObstacle().
+        if (collision.gameObject.GetComponent<Obstacle>() != null)
         {
             _isDead = true;
 
