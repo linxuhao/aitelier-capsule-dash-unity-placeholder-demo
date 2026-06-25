@@ -1,14 +1,12 @@
-# Technical Architecture Design — Capsule Dash: Obstacle Death Fix & Wind Particle Enhancement
+# Technical Architecture Design — Fix Obstacle Collision Death Detection (Tag → Component Check)
 
 ## Overview
 
-This design addresses two issues in the Capsule Dash 3D endless runner:
+This design addresses a single bug in the Capsule Dash 3D endless runner: the player fails to die on obstacle collision because the `"Obstacle"` Unity tag is not registered in the project's `TagManager.asset` (`tags: []` — zero custom tags). The fix replaces tag-based collision detection (`CompareTag("Obstacle")`) with component-based detection (`GetComponent<Obstacle>() != null`), which is already guaranteed to work because every obstacle has the `Obstacle` MonoBehaviour attached by `ObstacleSpawner.CreateObstacle()`.
 
-1. **Obstacle Collision Death Fix**: The `OnCollisionEnter` code in `PlayerController` already exists and is logically correct, but collision detection may fail at runtime because (a) the player's Rigidbody uses discrete collision detection, allowing fast-moving obstacles to tunnel through the player (bullet-through-paper), and (b) the player's Rigidbody is configured with non-kinematic constraints that could interfere. The fix is minimal: enable **Continuous Dynamic collision detection** on the player Rigidbody and add a defensive debug-log to aid verification.
+The fix is a **one-line change** in `PlayerController.OnCollisionEnter()`, plus an **optional one-line cleanup** in `ObstacleSpawner.CreateObstacle()` to remove the dead-code tag assignment that generates the `"Tag: Obstacle is not defined"` console error.
 
-2. **Wind/Scroll Particle Enhancement**: The current `WindEffect` uses a basic `Stretch`-billboard `ParticleSystem` with white semi-transparent particles emitting from a box volume. This produces thin white dots that lack visual depth. The enhancement adds three additional ParticleSystem modules — **Trails** (PerParticle mode), **ColorOverLifetime**, and **SizeOverLifetime** — all purely code-configurable, requiring no new assets or Placeholders modifications. The result is realistic fading speed-line streaks with natural size variation and alpha fade-in/fade-out.
-
-Both changes integrate into the existing code without architectural refactoring. No new files are needed — only modifications to two existing scripts: `PlayerController.cs` and `WindEffect.cs`. All other components (`SceneBootstrapper`, `GameManager`, `UIManager`, `ObstacleSpawner`, `Obstacle`, `InputHandler`, `CameraFollow`, `Placeholders`) remain unchanged.
+No new files, no new components, no SceneBootstrapper changes, no asset changes. Two existing files are modified.
 
 ---
 
@@ -17,97 +15,59 @@ Both changes integrate into the existing code without architectural refactoring.
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │                       SceneBootstrapper                              │
-│  BuildScene(): wires Player + WindEffect + GameManager + Spawner     │
-│  (NO CHANGE — already correctly attaches WindEffect to Player)       │
+│  BuildScene(): wires Player + ObstacleSpawner + GameManager          │
+│  (NO CHANGE — already correctly attaches all components)             │
 └───────┬──────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  ┌────────────────────┐    ┌────────────────────┐                    │
-│  │     Player         │    │     Camera         │                    │
-│  │   (Capsule)        │    │   (Follow)          │                    │
-│  │   Z=0 stationary   │    │   Z offset behind   │                    │
-│  │  ┌───────────────┐ │    └────────────────────┘                    │
-│  │  │  WindEffect    │ │                                              │
-│  │  │  (child GO)    │ │                                              │
-│  │  │  ┌───────────┐ │ │                                              │
-│  │  │  │ Particle  │ │ │  ← Trails module (NEW)                       │
-│  │  │  │ System    │ │ │  ← ColorOverLifetime (NEW)                   │
-│  │  │  │ ───────── │ │ │  ← SizeOverLifetime (NEW)                    │
-│  │  │  │ Stretch   │ │ │  ← existing: Shape, Emission, Velocity       │
-│  │  │  └───────────┘ │ │                                              │
-│  │  └───────────────┘ │                                              │
-│  │  ┌───────────────┐ │                                              │
-│  │  │ PlayerControl │ │  ← CCD added on Rigidbody (NEW)              │
-│  │  │ OnCollision   │ │  ← _isDead guard → red material → GameOver() │
-│  │  └───────────────┘ │                                              │
-│  └────────┬───────────┘                                              │
+│  │     Player         │    │  ObstacleSpawner   │                    │
+│  │   (Capsule)        │    │  (standalone GO)   │                    │
+│  │  ┌───────────────┐ │    │  ┌───────────────┐ │                    │
+│  │  │ PlayerControl │ │    │  │ ObjectPool    │ │                    │
+│  │  │               │ │    │  │ <GameObject>  │ │                    │
+│  │  │ OnCollision   │ │    │  └───────┬───────┘ │                    │
+│  │  │ Enter()       │ │    │          │          │                    │
+│  │  │  ┌──────────┐ │ │    │  CreateObstacle()  │                    │
+│  │  │  │ FIX:     │ │ │    │   ┌──────────────┐ │                    │
+│  │  │  │ GetComp  │─┼─┼────┼──→│ Obstacle     │ │                    │
+│  │  │  │ onent<>  │ │ │    │   │ component    │ │                    │
+│  │  │  │ instead  │ │ │    │   └──────────────┘ │                    │
+│  │  │  │ of       │ │ │    │   ┌──────────────┐ │                    │
+│  │  │  │ Compare  │ │ │    │   │ CLEANUP:     │ │                    │
+│  │  │  │ Tag()    │ │ │    │   │ remove tag=  │ │                    │
+│  │  │  └──────────┘ │ │    │   │ "Obstacle"   │ │                    │
+│  │  └───────────────┘ │    │   └──────────────┘ │                    │
+│  └────────┬───────────┘    └────────────────────┘                    │
 │           │                                                           │
 │  ┌────────┴──────────────────────────────────────────────────┐       │
 │  │                    GameManager                             │       │
-│  │  [DefaultExecutionOrder(-100)] singleton                   │       │
-│  │  Distance += ForwardSpeed * dt                             │       │
-│  │  GameOver() → OnGameOver event → UIManager.ShowGameOver()  │       │
-│  └────────┬──────────────────────────────────────────────────┘       │
-│           │                                                           │
-│  ┌────────┴──────────────────────────────────────────────────┐       │
-│  │              ObstacleSpawner                               │       │
-│  │  ObjectPool<GameObject> (cube obstacles)                   │       │
-│  │  CreateObstacle() → Placeholders.CreatePrimitive(Cube)     │       │
-│  │  → tag = "Obstacle"  →  AddComponent<Obstacle>()           │       │
-│  └────────┬──────────────────────────────────────────────────┘       │
-│           │                                                           │
-│  ┌────────┴──────────────────────────────────────────────────┐       │
-│  │              Obstacle (per-instance)                       │       │
-│  │  Scrolls toward player: Vector3.back * speed * dt          │       │
-│  │  Self-returns to pool when Z < player.Z - 10f              │       │
-│  │  BoxCollider (from CreatePrimitive) — NOT trigger          │       │
-│  └───────────────────────────────────────────────────────────┘       │
-│                                                                       │
-│  ┌───────────────────────────────────────────────────────────┐       │
-│  │                  UI Canvas                                 │       │
-│  │  UIManager: ScoreText (HUD) + GameOverPanel                │       │
-│  │  Subscribes to OnGameOver → shows panel on death           │       │
+│  │  GameOver() → OnGameOver event → UIManager                 │       │
+│  │  (NO CHANGE)                                               │       │
 │  └───────────────────────────────────────────────────────────┘       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Data Flow
+### Data Flow (Collision → Death)
 
 ```
-UPDATE LOOP:
-  InputHandler → LeftPressed/RightPressed/JumpPressed
-  PlayerController:
-    ┌─ Reads InputHandler → lane switch (X lerp) / jump (Impulse)
-    ├─ FixedUpdate: Z velocity = 0 (stationary player)
-    ├─ Ground check: raycast down
-    └─ OnCollisionEnter(collision):
-        if collision.CompareTag("Obstacle") ∧ !_isDead:
-          _isDead = true
-          renderer.material.color = Color.red
-          GameManager.Instance.GameOver()
-  
-  ObstacleSpawner:
-    └─ _scrollDistance += ForwardSpeed * dt
-       if _scrollDistance >= _nextSpawnZ → spawn via pool.Get()
-  
-  Each Obstacle:
-    └─ transform.position += Vector3.back * _scrollSpeed * dt
-       if Z < player.Z - 10f → pool.Release()
-  
-  WindEffect:
-    └─ ParticleSystem auto-emits (playOnAwake + loop)
-       Trails module draws fading streaks behind each particle
-       ColorOverLifetime fades alpha from 0→0.5→0
-       SizeOverLifetime scales from 0.02→0.08→0.02
+ObstacleSpawner.CreateObstacle()
+  └─ Placeholders.CreatePrimitive(Cube, red, "Obstacle")
+  └─ cube.AddComponent<Obstacle>()          ← Guarantees Obstacle component exists
+  └─ [cube.tag = "Obstacle";]               ← REMOVED (dead code, generates error)
 
-GAME OVER:
-  PlayerController.OnCollisionEnter → GameManager.GameOver()
-    → IsGameOver = true
-    → OnGameOver event fires
-      → UIManager.ShowGameOver() → activates GameOverPanel
-      → Distance stops accumulating (GameManager.Update guard)
-      → ObstacleSpawner stops spawning (IsGameOver guard)
+PlayerController.OnCollisionEnter(Collision collision)
+  ├─ if (_isDead) return;                   ← Existing double-trigger guard
+  ├─ OLD: if (collision.gameObject.CompareTag("Obstacle"))
+  │        → Always returns false (tag not registered in TagManager)
+  │
+  └─ NEW: if (collision.gameObject.GetComponent<Obstacle>() != null)
+           → Returns true for obstacles (component exists)
+           → Returns false for ground/walls/lane-markers (no component)
+     ├─ _isDead = true;
+     ├─ renderer.material.color = Color.red;  ← Existing death visual
+     └─ GameManager.Instance.GameOver();      ← Existing death notification
 ```
 
 ---
@@ -117,235 +77,91 @@ GAME OVER:
 ```
 Assets/
   Scripts/
-    Placeholders.cs           — (NO CHANGE) 
-    SceneBootstrapper.cs      — (NO CHANGE) Already wires WindEffect to player
-    GameManager.cs            — (NO CHANGE) 
-    PlayerController.cs       — (MODIFY) Add CCD on Rigidbody in Awake()
-    CameraFollow.cs           — (NO CHANGE) 
-    ObstacleSpawner.cs        — (NO CHANGE) Already tags obstacles correctly
-    Obstacle.cs               — (NO CHANGE) Pool-safe, no Rigidbody needed
-    UIManager.cs              — (NO CHANGE) Already subscribes to OnGameOver
-    InputHandler.cs           — (NO CHANGE) 
-    WindEffect.cs             — (MODIFY) Add Trails, ColorOverLifetime, SizeOverLifetime
+    PlayerController.cs       — (MODIFY) Line 204: CompareTag → GetComponent<Obstacle>
+    ObstacleSpawner.cs        — (MODIFY) Line 163: remove cube.tag = "Obstacle"
+    Obstacle.cs               — (NO CHANGE) Existing MonoBehaviour, used for GetComponent check
+    GameManager.cs            — (NO CHANGE)
+    SceneBootstrapper.cs      — (NO CHANGE)
+    Placeholders.cs           — (NO CHANGE)
+    InputHandler.cs           — (NO CHANGE)
+    CameraFollow.cs           — (NO CHANGE)
+    UIManager.cs              — (NO CHANGE)
+    WindEffect.cs             — (NO CHANGE)
   Editor/
-    SceneBaker.cs             — (NO CHANGE) 
+    SceneBaker.cs             — (NO CHANGE)
 ```
 
 ---
 
 ## Component Specifications
 
-### 1. PlayerController (MODIFY — Collision Death Fix)
+### 1. PlayerController (MODIFY — Collision Detection Fix)
 
 **File**: `Assets/Scripts/PlayerController.cs`
 
-**Changes**: Two additions in `Awake()`:
+**Change**: One-line replacement in `OnCollisionEnter()`, at line 204.
 
-1. **Enable Continuous Dynamic Collision Detection** on the player's Rigidbody. This prevents the bullet-through-paper problem where a fast-moving static collider (obstacle) tunnels through the player between physics frames.
-
-2. **Add a one-time debug log** inside `OnCollisionEnter` to confirm collisions are detected. This is a development aid — remove or comment out after verification.
-
-**Modified Awake() — add after existing Rigidbody configuration**:
-
+**Before** (line 204):
 ```csharp
-// After the existing Rigidbody config (_rb.constraints = FreezeRotation;):
-// Enable Continuous Dynamic CCD to prevent obstacles from tunneling through
-// the player at high relative speeds (bullet-through-paper effect).
-// Obstacles move via Transform (static colliders), so CCD on the player's
-// Rigidbody ensures the sweep test catches them every frame.
-_rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
+if (collision.gameObject.CompareTag("Obstacle"))
 ```
 
-**Rationale**: The SOTA research identified discrete collision detection as the most likely root cause of missed collisions. Obstacles move at 8 units/s via `transform.position` (making them "static colliders" from Unity's perspective). At this speed, an obstacle could traverse the player's capsule radius between physics steps when using discrete detection. `ContinuousDynamic` adds a sweep test that guarantees the collision is detected regardless of relative speed.
-
-**Cost**: Negligible — `ContinuousDynamic` on a single Rigidbody has no measurable performance impact.
-
-**OnCollisionEnter** — add a debug log (temporary, for verification):
-
+**After**:
 ```csharp
-private void OnCollisionEnter(Collision collision)
-{
-    // Debug log to verify collision detection is firing
-    // Remove after confirming death works correctly
-    Debug.Log($"Player.OnCollisionEnter: collided with '{collision.gameObject.name}' (tag={collision.gameObject.tag})");
-
-    if (_isDead)
-        return;
-
-    if (collision.gameObject.CompareTag("Obstacle"))
-    {
-        _isDead = true;
-
-        MeshRenderer renderer = GetComponent<MeshRenderer>();
-        if (renderer != null && renderer.material != null)
-        {
-            renderer.material.color = Color.red;
-        }
-
-        if (GameManager.Instance != null)
-        {
-            GameManager.Instance.GameOver();
-        }
-    }
-}
+if (collision.gameObject.GetComponent<Obstacle>() != null)
 ```
 
-**No other changes to PlayerController.** Lane switching, jumping, ground check, death visual, and GameOver() call remain unchanged.
+**Rationale**:
+- `CompareTag("Obstacle")` requires the tag to be registered in `ProjectSettings/TagManager.asset`. The project's TagManager has `tags: []` — the tag is unregistered, so `CompareTag()` always returns `false`.
+- `GetComponent<Obstacle>()` is a pure C# type-check against the `Obstacle` MonoBehaviour. It requires no Unity Editor configuration, no tag registration, and works identically in Play mode, baked scenes, and built players.
+- Every obstacle cube already has the `Obstacle` component attached — guaranteed by `ObstacleSpawner.CreateObstacle()` calling `cube.AddComponent<Obstacle>()` immediately after primitive creation (line 164).
+- Ground (`"Ground"` tag), lane markers, walls, and the player itself have no `Obstacle` component, so `GetComponent<Obstacle>()` naturally returns `null` for them. No false-positive death triggers.
+- The existing `_isDead` guard (line 200) and death behavior (lines 206–219: material color change to red, `GameManager.GameOver()`) are preserved unchanged.
 
----
+**No other changes to PlayerController.** Lane switching, jumping, ground check, Rigidbody configuration (including CCD which was added in a prior fix), and the debug log line remain as-is.
 
-### 2. WindEffect (MODIFY — Particle Enhancement)
+### 2. ObstacleSpawner (MODIFY — Optional Cleanup)
 
-**File**: `Assets/Scripts/WindEffect.cs`
+**File**: `Assets/Scripts/ObstacleSpawner.cs`
 
-**Changes**: Add three new modules to `ConfigureParticleSystem()`:
-- **Trails module** (`PerParticle` mode) — creates fading streaks behind each particle for realistic speed-line appearance
-- **ColorOverLifetime module** — fades particle alpha from 0→0.5→0 for smooth birth/death
-- **SizeOverLifetime module** — scales particles from 0.02→0.08→0.02 for natural size variation
+**Change**: Remove the tag assignment on line 163.
 
-All three are purely code-configurable via the Unity ParticleSystem API. No new fields, no Placeholders changes, no assets.
-
-**Modified `ConfigureParticleSystem()` method** — additions at the end, after the existing Renderer configuration:
-
+**Before** (lines 161–165):
 ```csharp
-private void ConfigureParticleSystem(ParticleSystem ps)
-{
-    // ---- Main Module (existing — slightly adjusted) ----
-    var main = ps.main;
-    main.startLifetime = _particleLifetime;
-    main.startSize = 0.05f;
-    main.startColor = new Color(1f, 1f, 1f, 0.5f);
-    main.simulationSpace = ParticleSystemSimulationSpace.World;
-    main.playOnAwake = true;
-    main.loop = true;
-    main.startSpeed = 0f;
-
-    // ---- Emission Module (existing) ----
-    var emission = ps.emission;
-    emission.rateOverTime = _emissionRate;
-
-    // ---- Shape Module (existing) ----
-    var shape = ps.shape;
-    shape.shapeType = ParticleSystemShapeType.Box;
-    shape.scale = new Vector3(_emissionWidth, _emissionHeight, _emissionDepth);
-    shape.position = new Vector3(0f, 0f, _emissionZOffset);
-
-    // ---- Velocity Over Lifetime Module (existing) ----
-    var velocityOverLifetime = ps.velocityOverLifetime;
-    velocityOverLifetime.enabled = true;
-    velocityOverLifetime.z = -_particleSpeed;
-
-    // ---- Color Over Lifetime Module (NEW) ----
-    // Fade particles in at birth and out near death for smooth alpha transitions.
-    // Gradient: alpha 0 at 0% → 0.5 at 40% → 0.5 at 60% → 0 at 100%
-    var colorOverLifetime = ps.colorOverLifetime;
-    colorOverLifetime.enabled = true;
-    Gradient colorGradient = new Gradient();
-    colorGradient.SetKeys(
-        new GradientColorKey[]
-        {
-            new GradientColorKey(Color.white, 0f),
-            new GradientColorKey(Color.white, 1f)
-        },
-        new GradientAlphaKey[]
-        {
-            new GradientAlphaKey(0f,   0.0f),  // transparent at birth
-            new GradientAlphaKey(0.5f, 0.4f),  // fade in to half-opaque
-            new GradientAlphaKey(0.5f, 0.6f),  // hold at half-opaque
-            new GradientAlphaKey(0f,   1.0f)   // fade out before death
-        }
-    );
-    colorOverLifetime.color = new ParticleSystem.MinMaxGradient(colorGradient);
-
-    // ---- Size Over Lifetime Module (NEW) ----
-    // Grow particles after birth, then shrink before death.
-    // Creates a natural "streak" appearance: particles swell as they pass by.
-    var sizeOverLifetime = ps.sizeOverLifetime;
-    sizeOverLifetime.enabled = true;
-    AnimationCurve sizeCurve = new AnimationCurve(
-        new Keyframe(0f,   0.02f),   // small at birth
-        new Keyframe(0.3f, 0.08f),   // grow to full size
-        new Keyframe(0.7f, 0.08f),   // hold at full size
-        new Keyframe(1f,   0.02f)    // shrink before death
-    );
-    sizeOverLifetime.size = new ParticleSystem.MinMaxCurve(1f, sizeCurve);
-
-    // ---- Trails Module (NEW) — PRIMARY ENHANCEMENT ----
-    // PerParticle trails produce fading streaks behind each particle,
-    // creating realistic speed-line visuals that convincingly convey
-    // forward motion past a stationary player.
-    var trails = ps.trails;
-    trails.enabled = true;
-    trails.mode = ParticleSystemTrailMode.PerParticle;
-    trails.lifetime = 0.3f;  // trail persists for 0.3s behind particle
-
-    // Trail width curve: thinner at birth, thicker as particle ages
-    AnimationCurve trailWidthCurve = new AnimationCurve(
-        new Keyframe(0f, 0.02f),
-        new Keyframe(0.5f, 0.08f),
-        new Keyframe(1f, 0.01f)
-    );
-    trails.widthOverTrail = new ParticleSystem.MinMaxCurve(1f, trailWidthCurve);
-
-    // Trail color: match particle color with its own alpha fade
-    Gradient trailColorGradient = new Gradient();
-    trailColorGradient.SetKeys(
-        new GradientColorKey[]
-        {
-            new GradientColorKey(Color.white, 0f),
-            new GradientColorKey(Color.white, 1f)
-        },
-        new GradientAlphaKey[]
-        {
-            new GradientAlphaKey(0.3f, 0f),
-            new GradientAlphaKey(0f,   1f)
-        }
-    );
-    trails.colorOverTrail = new ParticleSystem.MinMaxGradient(trailColorGradient);
-
-    // Each particle gets its own trail (PerParticle mode)
-    trails.ratio = 1.0f;
-
-    // ---- Renderer Module (existing — unchanged) ----
-    var renderer = ps.GetComponent<ParticleSystemRenderer>();
-    renderer.renderMode = ParticleSystemRenderMode.Stretch;
-    renderer.lengthScale = 2f;
-    renderer.velocityScale = 0.15f;
-    renderer.material = _particleMaterial;
-    renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-    renderer.receiveShadows = false;
-}
+Color color = _obstacleMaterial != null ? _obstacleMaterial.color : Color.red;
+GameObject cube = Placeholders.CreatePrimitive(PrimitiveType.Cube, color, "Obstacle");
+cube.tag = "Obstacle";
+cube.AddComponent<Obstacle>();
+return cube;
 ```
 
-**Serialized Fields**: No new fields needed. The existing fields (`_particleMaterial`, `_particleSpeed`, `_emissionRate`, `_particleLifetime`, `_emissionWidth`, `_emissionHeight`, `_emissionDepth`, `_emissionZOffset`) are sufficient — the new modules use hardcoded curves that produce good visual results and can be tweaked by developers directly in the code.
+**After**:
+```csharp
+Color color = _obstacleMaterial != null ? _obstacleMaterial.color : Color.red;
+GameObject cube = Placeholders.CreatePrimitive(PrimitiveType.Cube, color, "Obstacle");
+cube.AddComponent<Obstacle>();
+return cube;
+```
 
-**Rationale for each module**:
-
-| Module | Purpose | Visual Impact |
-|--------|---------|---------------|
-| **Trails (PerParticle)** | Each particle leaves a fading streak behind it | Produces the classic "speed line" look — the single most impactful enhancement. Trails fade naturally over 0.3s and thin at the tip. |
-| **ColorOverLifetime** | Alpha ramp: 0→0.5→0 over particle lifetime | Eliminates the "pop in / pop out" artifact of the current system. Particles fade in softly at birth and out near death. |
-| **SizeOverLifetime** | Scale ramp: 0.02→0.08→0.02 | Particles swell as they pass the player and shrink as they recede, adding depth and organic feel. Combined with trails, this creates a convincing speed-streak effect. |
-
-**Performance note**: The Trails module increases draw calls per particle, but the `_emissionRate` of 50 and lifetime of 2s means at most ~100 active particles at any time. PerParticle trails add one trail quad per particle — well within budget for any modern platform. If performance tuning is needed, reduce `_emissionRate` via the existing Inspector field.
-
-**Ribbon mode avoided**: The SOTA research flagged a Unity bug where `ParticleSystemTrailMode.Ribbon` produces incorrect indexing above 31 particles. PerParticle mode is safe at any particle count and produces visually comparable results.
+**Rationale**:
+- Once `PlayerController` no longer uses `CompareTag("Obstacle")`, setting the tag is dead code.
+- The `cube.tag = "Obstacle"` assignment is the sole source of the `"Tag: Obstacle is not defined"` console error. Removing it silences the error entirely.
+- A grep of the codebase confirms no other script references the `"Obstacle"` tag — neither `GameObject.FindGameObjectWithTag("Obstacle")` nor any `CompareTag("Obstacle")` remain after the PlayerController fix.
+- This cleanup is **optional** within the project goals (the brief only requires changing PlayerController), but strongly recommended for a clean console.
 
 ---
 
 ## Component Interaction Matrix (Unchanged)
 
-| From → To | Game Manager | Player Controller | Obstacle Spawner | Obstacle | UI Manager | Wind Effect | Camera Follow | Input Handler |
-|------------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **GameManager** | — | — | — | — | events | — | — | — |
-| **PlayerController** | `.IsGameOver` `.GameOver()` | — | — | — | — | — | — | reads `.LeftPressed` etc. |
-| **ObstacleSpawner** | `.IsGameOver` `.ForwardSpeed` | `.position.z` | — | `.Configure()` | — | — | — | — |
-| **Obstacle** | `.ForwardSpeed` (cached) | `.position.z` | — | — | — | — | — | — |
-| **UIManager** | `.Distance` `.OnGameOver` `.OnRestart` | — | — | — | — | — | — | `.RestartPressed` |
-| **WindEffect** | `.ForwardSpeed` (fallback) | — | — | — | — | — | — | — |
-| **CameraFollow** | — | `.position` | — | — | — | — | — | — |
+| From → To | GameManager | PlayerController | ObstacleSpawner | Obstacle | UIManager |
+|------------|:---:|:---:|:---:|:---:|:---:|
+| **GameManager** | — | — | — | — | events |
+| **PlayerController** | `.IsGameOver` `.GameOver()` | — | — | `GetComponent<Obstacle>()` | — |
+| **ObstacleSpawner** | `.IsGameOver` `.ForwardSpeed` | `.position.z` | — | `.Configure()` | — |
+| **Obstacle** | `.ForwardSpeed` (cached) | `.position.z` | — | — | — |
+| **UIManager** | `.Distance` `.OnGameOver` `.OnRestart` | — | — | — | — |
 
-No interaction changes. The CCD addition in `PlayerController` is internal (Rigidbody property). The particle module additions in `WindEffect` are internal (ParticleSystem configuration).
+The only change: `PlayerController → Obstacle` now uses `GetComponent<Obstacle>()` (component type reference) instead of `CompareTag("Obstacle")` (string-based tag lookup). This is a compile-time dependency on the `Obstacle` class — same as the existing dependency on `GameManager`, `InputHandler`, and `Placeholders`.
 
 ---
 
@@ -353,11 +169,10 @@ No interaction changes. The CCD addition in `PlayerController` is internal (Rigi
 
 **No changes needed.** The `SceneBootstrapper.BuildScene()` method already:
 
-1. Creates the Player capsule with Rigidbody, InputHandler, and PlayerController (step 3, lines 77–94)
-2. Creates WindEffect as a child GameObject of Player and attaches the `WindEffect` component (step 3, lines 98–101)
-3. Creates the ObstacleSpawner (step 8, line 241–242) — which creates obstacles tagged `"Obstacle"` with BoxColliders
+1. Creates the Player capsule with `PlayerController` attached (lines 77–94). `PlayerController.Awake()` configures the Rigidbody and self-supplies materials — the `OnCollisionEnter` change is internal to the component.
+2. Creates the `ObstacleSpawner` (lines 241–242). `ObstacleSpawner.Awake()` creates the object pool — the tag-removal in `CreateObstacle()` is internal to the spawner.
 
-Both the collision death fix and the wind particle enhancement are internal to their respective components (`PlayerController.Awake()` and `WindEffect.Awake()`/`ConfigureParticleSystem()`). The bootstrapper automatically picks up the changes because it instantiates the same components.
+Both the runtime path (`Awake()` → `BuildScene()`) and the Editor bake path (`Tools > Bake Scene to Hierarchy` → `BuildScene()`) call the same `BuildScene()` method, so the fix works identically in both modes without any bootstrapper changes.
 
 ---
 
@@ -365,75 +180,57 @@ Both the collision death fix and the wind particle enhancement are internal to t
 
 | Concern | Technology | Rationale |
 |---------|-----------|-----------|
-| Engine | Unity 6 (6000.0+) | Required by project brief |
+| Engine | Unity 6 (6000.0+) | Required by project |
 | Language | C# (pure scripts) | Project constraint |
-| Collision detection | `Rigidbody.collisionDetectionMode = ContinuousDynamic` | Prevents bullet-through-paper for fast-moving static colliders |
-| Death response | `OnCollisionEnter` + tag check + `GameManager.GameOver()` | Already implemented; CCD makes it reliable |
-| Particle trails | `ParticleSystemTrailMode.PerParticle` | Fading speed-line streaks behind particles |
-| Particle alpha fade | `ParticleSystem.ColorOverLifetimeModule` + `Gradient` with alpha keys | Smooth fade-in/fade-out for particles |
-| Particle size variation | `ParticleSystem.SizeOverLifetimeModule` + `AnimationCurve` | Natural swell-and-shrink for particles |
-| Particle rendering | `ParticleSystemRenderMode.Stretch` | Existing stretch billboard for speed lines |
-| Scene build | `SceneBootstrapper.BuildScene()` | No changes needed |
-| Placeholders | `Placeholders.CreateMaterial()` | No changes needed |
+| Collision detection | `MonoBehaviour.OnCollisionEnter(Collision)` | Existing callback, unchanged |
+| Death condition | `GameObject.GetComponent<Obstacle>() != null` | Replaces `CompareTag("Obstacle")` — zero-config, works everywhere |
+| Death response | `GameManager.Instance.GameOver()` + material color change | Existing behavior, preserved |
+| Obstacle identification | `Obstacle` MonoBehaviour (marker component) | Already attached to every pooled obstacle |
 
 ---
 
 ## Bug Fix Traceability
 
-| Issue | Root Cause | Fix | File(s) Changed |
-|-------|-----------|-----|-----------------|
-| **Player doesn't die on obstacle collision** | Player's Rigidbody uses discrete collision detection → fast-moving obstacles (static colliders at 8 units/s) can tunnel through the player capsule between physics frames. The `OnCollisionEnter` code itself is correct. | Add `_rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic` in `PlayerController.Awake()`. Add debug log for verification. | `PlayerController.cs` |
-| **Wind/scroll particles look basic** | Current system uses only Stretch billboard + VelocityOverLifetime. Particles are flat white dots that pop in/out — no trails, no fade, no size variation. | Add Trails (PerParticle mode), ColorOverLifetime (alpha gradient), and SizeOverLifetime (size curve) modules to `WindEffect.ConfigureParticleSystem()`. | `WindEffect.cs` |
+| Issue | Root Cause | Fix | File(s) Changed | Lines |
+|-------|-----------|-----|-----------------|-------|
+| Player doesn't die on obstacle collision | `CompareTag("Obstacle")` always returns `false` because the `"Obstacle"` tag is not registered in `ProjectSettings/TagManager.asset` (`tags: []`). The tag assignment `cube.tag = "Obstacle"` in `CreateObstacle()` silently fails at runtime. | Replace `CompareTag("Obstacle")` with `GetComponent<Obstacle>() != null` — a type-based check that requires no tag registration. | `PlayerController.cs` | 204 |
+| Console error: "Tag: Obstacle is not defined" | `ObstacleSpawner.CreateObstacle()` sets `cube.tag = "Obstacle"` on every spawned cube, but the tag doesn't exist in TagManager. | Remove the `cube.tag = "Obstacle"` line — dead code after the PlayerController fix. | `ObstacleSpawner.cs` | 163 |
 
 ---
 
 ## Edge Cases Addressed
 
-### Collision Death
-
 | Edge Case | Mitigation | Where |
 |-----------|-----------|-------|
-| Bullet-through-paper (obstacle tunnels through player) | `ContinuousDynamic` CCD sweep-tests the player's collider each physics step | `PlayerController.Awake()` |
-| Double-death trigger | `_isDead` guard in `OnCollisionEnter` (existing) | `PlayerController.cs` |
-| Pooled obstacle collider state corruption | `Obstacle.OnDisable()` safety net returns to pool; `actionOnGet` calls `SetActive(true)` which re-enables collider | `Obstacle.cs`, `ObstacleSpawner.Awake()` |
-| Missing "Obstacle" tag | `CreateObstacle()` explicitly sets `cube.tag = "Obstacle"` (existing) | `ObstacleSpawner.CreateObstacle()` |
-| Player Rigidbody becomes kinematic | `[RequireComponent(typeof(Rigidbody))]` ensures Rigidbody exists; `Awake()` configures it as non-kinematic (existing, mass/constraints are set) | `PlayerController.cs` |
-| Collider accidentally set as trigger | `GameObject.CreatePrimitive()` creates colliders with `isTrigger = false` by default; no code sets it to true | N/A |
-| GameOver after death | `GameManager.GameOver()` is idempotent (`IsGameOver` guard) | `GameManager.cs` |
-
-### Wind Particle
-
-| Edge Case | Mitigation | Where |
-|-----------|-----------|-------|
-| Trail module Ribbon mode indexing bug | Use `PerParticle` mode, not `Ribbon` — works correctly at any particle count | `WindEffect.ConfigureParticleSystem()` |
-| Particles/shadows rendering over UI | `ScreenSpaceOverlay` Canvas always renders on top of world-space particles (existing) | `SceneBootstrapper.BuildScene()` |
-| World-space particles during lane switch | `simulationSpace = World` — particles stay in world space, player moves through them (existing) | `WindEffect.ConfigureParticleSystem()` |
-| Lifetime/speed mismatch | Existing `_particleLifetime` (2s) × `_particleSpeed` (8 units/s) = 16 units travel distance, well within camera far plane (100 units) | `WindEffect.cs` fields |
-| Performance at high particle counts | `_emissionRate = 50` × 2s lifetime = ~100 active particles; PerParticle trails add ~100 trail quads — well within budget | `WindEffect.cs` |
-| Material transparency across pipelines | `Placeholders.CreateMaterial()` uses shader fallback chain (URP Lit → Standard → Unlit/Color) — `Unlit/Color` supports alpha blending for particles | `Placeholders.cs` |
+| Double-death trigger (simultaneous collisions) | Existing `_isDead` guard at top of `OnCollisionEnter` — returns immediately if already dead | `PlayerController.cs` line 200 |
+| Ground collision false-positive | Ground plane has no `Obstacle` component → `GetComponent<Obstacle>()` returns `null` → death not triggered | Implicit via component absence |
+| Lane marker collision false-positive | Lane markers are Cylinder primitives with no `Obstacle` component → `GetComponent<Obstacle>()` returns `null` | Implicit via component absence |
+| Obstacle pool guarantees component presence | `CreateObstacle()` calls `cube.AddComponent<Obstacle>()` unconditionally on every new pooled object | `ObstacleSpawner.cs` line 164 |
+| Obstacle child colliders (future) | Not applicable — obstacles are simple Cube primitives with no children. If future obstacles had children with colliders, `GetComponentInParent<Obstacle>()` would be needed on `collision.gameObject`. Current design uses `GetComponent<Obstacle>()` on `collision.gameObject` (the root), which is correct for the current obstacle structure. | N/A (future concern) |
+| Baked scene compatibility | The fix uses only `GetComponent<T>()`, a core Unity API that works identically in Edit mode and Play mode. Baked scenes have the same component structure as runtime-built scenes. | `PlayerController.cs` |
+| Player Rigidbody CCD already enabled | A prior fix already added `_rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic` (line 112). This prevents bullet-through-paper tunneling at high speeds — a separate concern from the tag check, but complementary. | `PlayerController.cs` line 112 (existing) |
 
 ---
 
 ## Extensibility Points (Future, Not Implemented Now)
 
-- **WindEffect stops on GameOver**: Subscribe to `GameManager.OnGameOver` and call `ps.Stop()` / `ps.Clear()` to freeze particles when the run ends.
-- **Scroll speed increase over time**: Modify `GameManager.ForwardSpeed`; `WindEffect._particleSpeed` can re-read it each frame for auto-acceleration of particles.
-- **Additional wind layers**: Instantiate a second `WindEffect` child with different emission parameters for parallax depth.
-- **Obstacle death audio/vfx**: The `OnCollisionEnter` callback can trigger a one-shot particle burst or screen shake (out of scope for this fix).
-- **Tune trail/color/size curves via Inspector**: Convert hardcoded curves to `[SerializeField] AnimationCurve` / `[SerializeField] Gradient` fields for designer tweaking.
+- **Obstacle-type variants**: If new obstacle types are introduced (e.g., `TallObstacle : Obstacle`), `GetComponent<Obstacle>()` naturally matches all subclasses via polymorphism. No code change needed.
+- **Death effects**: The `_isDead = true` block in `OnCollisionEnter` can be extended with particle effects, screen shake, or audio — all within the same callback, without touching the detection logic.
+- **Non-obstacle kill triggers**: If a new hazard type uses a different component (e.g., `SpikeTrap`), add an `else if (collision.gameObject.GetComponent<SpikeTrap>() != null)` branch.
 
 ---
 
 ## RESOURCES.md Update Notes
 
-The existing `RESOURCES.md` already documents:
-- The `WindEffect` component and its `_particleMaterial` field for material replacement
-- The player-stationary architecture
+The existing `RESOURCES.md` already documents the obstacle spawning architecture. No structural changes are needed — the component-based detection is an internal implementation detail transparent to users replacing materials or creating prefabs.
 
-No structural changes to `RESOURCES.md` are needed. The added particle modules (Trails, ColorOverLifetime, SizeOverLifetime) are code-configured and produce their visuals at runtime — users replacing the `_particleMaterial` with a custom material will see the effect with the new trails/fade/size behavior automatically.
+One note to add to the Troubleshooting section (optional):
+
+> ### Player doesn't die on obstacle collision
+> - This was fixed in the latest update. Obstacle detection now uses component-based checking (`GetComponent<Obstacle>()`) instead of tag-based checking (`CompareTag("Obstacle")`). Ensure `ObstacleSpawner.CreateObstacle()` calls `AddComponent<Obstacle>()` on every spawned cube.
 
 ---
 
 ## Linter Manifest
 
-Only `.cs` files in this project. C# compilation is handled automatically by the Unity build system. The `linter_manifest.json` covers non-C# files only.
+Only `.cs` files are modified in this project. C# compilation is handled automatically by the Unity build system. The existing `linter_manifest.json` covers non-C# files (`.md`, `.json`) with `basic` linting — no changes needed.
