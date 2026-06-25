@@ -187,7 +187,7 @@ public class PlayerController : MonoBehaviour
         // The forwardSpeed lookup is retained (though unused for velocity) to
         // minimise the diff footprint and preserve the GameManager.Instance guard.
 
-        _rb.velocity = new Vector3(0f, _rb.velocity.y, 0f);
+        _rb.linearVelocity = new Vector3(0f, _rb.linearVelocity.y, 0f);
     }
 
     private void OnCollisionEnter(Collision collision)
