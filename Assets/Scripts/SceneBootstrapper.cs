@@ -71,7 +71,6 @@ public class SceneBootstrapper : MonoBehaviour
         // With the player-stationary refactor, the player stays at Z=0 while obstacles
         // scroll toward them — so ground only needs to exist around the player area.
         ground.transform.localScale = new Vector3(3f, 1f, 200f);
-        ground.tag = "Ground";
 
         // --- 3. Player Capsule ---
         GameObject player = Placeholders.CreatePrimitive(

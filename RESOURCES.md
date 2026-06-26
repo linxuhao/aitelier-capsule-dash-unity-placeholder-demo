@@ -156,7 +156,7 @@ Assets/
 ### Player falls through the ground
 - The ground Plane primitive has a `MeshCollider` by default
 - The player Capsule primitive has a `CapsuleCollider` by default
-- If this occurs, ensure the ground's tag is "Ground" and the player's Rigidbody has `useGravity = true`
+- If this occurs, ensure the player's Rigidbody has `useGravity = true` and the ground Plane has a MeshCollider (Unity primitives include this by default)
 
 ## Extending the Project
 
