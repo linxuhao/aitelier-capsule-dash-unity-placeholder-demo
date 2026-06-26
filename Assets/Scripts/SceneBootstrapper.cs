@@ -115,7 +115,13 @@ public class SceneBootstrapper : MonoBehaviour
         // Add the smooth follow component
         cam.gameObject.AddComponent<CameraFollow>();
 
-        // --- 5. UI Canvas ---
+        // --- 5. GameManager ---
+        // Created BEFORE UI Canvas so that UIManager.Start() never encounters a null
+        // GameManager.Instance, eliminating any race window for event subscription.
+        GameObject gmGo = new GameObject("GameManager");
+        gmGo.AddComponent<GameManager>();
+
+        // --- 6. UI Canvas ---
         GameObject uiGo = new GameObject("UI");
 
         // Canvas (Screen Space Overlay)
@@ -218,12 +224,22 @@ public class SceneBootstrapper : MonoBehaviour
         promptRt.pivot = new Vector2(0.5f, 0.5f);
         promptRt.anchoredPosition = new Vector2(0f, -60f);
 
-        // --- UIManager (attached to the Canvas root) ---
-        // The UIManager self-discovers ScoreText, GameOverPanel, and GameOverScoreText
-        // references via GameObject.Find in its Start() — no manual wiring needed.
-        uiGo.AddComponent<UIManager>();
+        // Assign a white 1x1 sprite to the GameOverPanel Image so it always renders
+        // as a solid color rectangle (some Unity versions skip Image rendering when
+        // no Source Image is assigned).
+        Texture2D whiteTex = new Texture2D(1, 1);
+        whiteTex.SetPixel(0, 0, Color.white);
+        whiteTex.Apply();
+        panelImage.sprite = Sprite.Create(whiteTex, new Rect(0, 0, 1, 1), new Vector2(0.5f, 0.5f));
 
-        // --- 6. EventSystem ---
+        // --- UIManager (attached to the Canvas root) ---
+        // Wire references explicitly via WireReferences(), eliminating GameObject.Find
+        // dependency at runtime. Self-supply in UIManager.Start() remains as fallback
+        // for baked scenes.
+        UIManager uiManager = uiGo.AddComponent<UIManager>();
+        uiManager.WireReferences(scoreText, panelGo, titleText, gameOverScoreText, promptText);
+
+        // --- 7. EventSystem ---
         // Required for UI raycasting (GraphicRaycaster needs an EventSystem in the scene)
         if (FindObjectOfType<EventSystem>() == null)
         {
@@ -232,16 +248,13 @@ public class SceneBootstrapper : MonoBehaviour
             eventSystemGo.AddComponent<StandaloneInputModule>();
         }
 
-        // --- 7. GameManager ---
-        GameObject gmGo = new GameObject("GameManager");
-        gmGo.AddComponent<GameManager>();
-
         // --- 8. ObstacleSpawner ---
         GameObject spawnerGo = new GameObject("ObstacleSpawner");
         spawnerGo.AddComponent<ObstacleSpawner>();
 
-        // --- 9. Lane Markers (optional visual guides) ---
-        CreateLaneMarkers();
+        // --- 9. LaneMarkerSpawner (scrolling lane markers — replaces static CreateLaneMarkers) ---
+        GameObject markerSpawnerGo = new GameObject("LaneMarkerSpawner");
+        markerSpawnerGo.AddComponent<LaneMarkerSpawner>();
 
         // --- 10. Self-destruct in Play mode ---
         if (Application.isPlaying)
@@ -253,34 +266,6 @@ public class SceneBootstrapper : MonoBehaviour
     }
 
     // --- Private Helpers ---
-
-    /// <summary>
-    /// Creates small cylinder markers along the ground to visually indicate the three lanes.
-    /// Markers are placed at five Z positions (5, 10, 15, 20, 25) for each lane X offset.
-    /// </summary>
-    private void CreateLaneMarkers()
-    {
-        // Three lanes at X offsets
-        float[] laneOffsets = { -2.5f, 0f, 2.5f };
-        // Z positions along the ground
-        float[] zPositions = { 5f, 10f, 15f, 20f, 25f };
-
-        Color markerColor = new Color(0.15f, 0.15f, 0.15f);
-
-        foreach (float x in laneOffsets)
-        {
-            foreach (float z in zPositions)
-            {
-                GameObject marker = Placeholders.CreatePrimitive(
-                    PrimitiveType.Cylinder,
-                    markerColor,
-                    "LaneMarker"
-                );
-                marker.transform.localScale = new Vector3(0.2f, 0.05f, 0.2f);
-                marker.transform.position = new Vector3(x, 0.025f, z);
-            }
-        }
-    }
 
     /// <summary>
     /// Attempts to assign the default TMP font to a TextMeshProUGUI component.
