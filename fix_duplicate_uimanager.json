@@ -1,0 +1,28 @@
+{
+  "task_id": "fix_duplicate_uimanager",
+  "description": "Delete UIManager_UPDATED.cs — stale duplicate causing CS0101 compile error",
+  "status": "completed",
+  "actions_taken": [
+    "Deleted Assets/Scripts/UIManager_UPDATED.cs (10,964 bytes, 306 lines)"
+  ],
+  "verification": {
+    "duplicate_file_deleted": true,
+    "canonical_file_intact": {
+      "path": "Assets/Scripts/UIManager.cs",
+      "size_bytes": 10964,
+      "lines": 306,
+      "contains_WireReferences": true,
+      "contains_ShowGameOver_refactored": true,
+      "contains_gameOverTitle_field": true,
+      "contains_restartPrompt_field": true
+    },
+    "scene_bootstrapper_ui_wiring": {
+      "path": "Assets/Scripts/SceneBootstrapper.cs",
+      "line": 240,
+      "call": "uiManager.WireReferences(scoreText, panelGo, titleText, gameOverScoreText, promptText)"
+    },
+    "no_other_references_to_deleted_file": true,
+    "compile_error_resolved": "CS0101 — duplicate UIManager class definition eliminated"
+  },
+  "notes": "No other files required modification. RESOURCES.md does not list UIManager_UPDATED.cs. No source files reference UIManager_UPDATED.cs. This was the sole blocking issue — all other fixes (LaneMarker, LaneMarkerSpawner, UIManager refactor, SceneBootstrapper reorder, RESOURCES.md update) were already applied and verified."
+}
