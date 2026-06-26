@@ -1,262 +1,450 @@
-# Technical Architecture Design — Fix Collision GameOver & Undefined "Ground" Tag
+# Technical Architecture Design — Game Over UI Fix & Scrolling Lane Markers
 
 ## Overview
 
-This design addresses two bugs in the 3D endless runner:
+This design addresses two issues in the 3D endless runner:
 
-1. **Player-obstacle collision does not trigger Game Over**: Obstacles are moved via `Transform.position += Vector3.back * speed * dt` in `Obstacle.Update()` but have **no Rigidbody component**. Unity's physics engine treats them as static colliders (Collider with no Rigidbody), and moving a static collider into a dynamic Rigidbody does NOT reliably fire `OnCollisionEnter` on the dynamic body. The fix: add a **kinematic Rigidbody** to each obstacle so the physics engine tracks its movement and properly triggers collision callbacks.
+1. **Game Over UI invisible**: When the player crashes into an obstacle, the dark overlay panel with "Game Over!", final distance, and "Press R to restart" does not appear — despite the `UIManager.ShowGameOver()` logic and GameManager event system appearing correct on the surface.
 
-2. **"Tag: Ground is not defined" console error**: `SceneBootstrapper.BuildScene()` line 74 sets `ground.tag = "Ground"`, but "Ground" is not a built-in Unity tag and not registered in `ProjectSettings/TagManager.asset` (`tags: []`). The fix: **remove the tag assignment** — no code in the project checks for the "Ground" tag.
+2. **Static lane markers**: Lane markers are 15 stationary cylinder primitives placed at fixed Z positions (5/10/15/20/25) in `CreateLaneMarkers()`. They never move, undercutting the sense of forward motion — especially since the player is stationary at Z=0 and obstacles scroll past.
 
-Both fixes are single-line changes in existing files. No new files, no new components, no SceneBootstrapper wiring changes needed.
+The root cause analysis below identifies the specific failure points, and the architecture delivers targeted fixes that integrate cleanly with the existing `SceneBootstrapper.BuildScene()` pipeline.
 
 ---
 
-## Architecture Diagram (Text)
+## Root Cause Analysis
+
+### Bug 1: Game Over UI Invisible
+
+**Primary Cause — `_gameOverScoreText` field populated incorrectly via `GameObject.Find` in UIManager.Start()**:
+
+`UIManager.Start()` self-discovers its references:
+
+```csharp
+if (_gameOverScoreText == null && _gameOverPanel != null)
+{
+    Transform child = _gameOverPanel.transform.Find("GameOverScoreText");
+    if (child != null)
+    {
+        _gameOverScoreText = child.GetComponent<TextMeshProUGUI>();
+    }
+}
+```
+
+This works — `_gameOverScoreText` is found. BUT the real failure is more subtle. The `GameOverPanel` GameObject is created by `BuildScene()` and `SetActive(false)` on line 168 (before UIManager is attached). In **baked scenes**, when Unity deserializes the hierarchy, the `GameOverPanel` starts inactive because that was its serialized state. `UIManager.Start()` runs, discovers the inactive panel via `GameObject.Find` (which does find inactive objects), and subscribes to events. Then `ShowGameOver()` is called on death and does `_gameOverPanel.SetActive(true)`.
+
+However, there is a **subtle Canvas rendering issue**: In Unity UI, when a child of a Canvas is activated via `SetActive(true)`, the Canvas must rebuild its vertex buffers. If the `GameOverPanel`'s `Image` component has no Source Image sprite assigned (it doesn't — it relies on tinting a default white rect), **certain Unity versions silently skip rendering the Image**, producing an invisible overlay. The TMP text children (`GameOverTitle`, `GameOverScoreText`, `RestartPrompt`) DO render — but they render directly on top of the existing `ScoreText` in the top-left corner, which may already be displaying "Distance: Xm". The result is text overlapping text, with no dark backing — appearing as "nothing happened" to the user, OR the white TMP text overlays the white ScoreText and becomes unreadable.
+
+**Contributing Factor — `GameOverScoreText` is the wrong element to display the full message**:
+
+`ShowGameOver()` sets ALL game-over text into `_gameOverScoreText`:
+
+```csharp
+_gameOverScoreText.text = $"Game Over!\nDistance: {GameManager.Instance.Distance:F0}m\nPress R to restart";
+```
+
+But the panel already has dedicated children: `GameOverTitle` ("Game Over!"), `GameOverScoreText` (score only), and `RestartPrompt` ("Press R to restart"). `ShowGameOver()` should populate each child individually. This is a minor UX issue — not the root cause of invisibility, but contributes to the "nothing looks right" experience.
+
+**Contributing Factor — Build order in `BuildScene()`**: UI Canvas + UIManager are created (line 224) BEFORE GameManager (line 237). Although `GameManager` uses `[DefaultExecutionOrder(-100)]` and `UIManager.Start()` retries subscription in `Update()`, moving GameManager before UI eliminates any theoretical race window and is a free safety improvement.
+
+**Fix Strategy**:
+1. Assign a white 1×1 sprite to the GameOverPanel `Image` so it always renders as a solid color rect.
+2. In `ShowGameOver()`, populate the dedicated `GameOverTitle` and `RestartPrompt` children individually, and use `GameOverScoreText` only for the score line.
+3. Move GameManager creation before UI in `BuildScene()`.
+4. Add a `LaneMarkerSpawner` reference lane-marker GameObject creation.
+
+### Bug 2: Static Lane Markers
+
+**Primary Cause — `CreateLaneMarkers()` creates static cylinders with no movement logic**:
+
+```csharp
+private void CreateLaneMarkers()
+{
+    float[] laneOffsets = { -2.5f, 0f, 2.5f };
+    float[] zPositions = { 5f, 10f, 15f, 20f, 25f };
+    // ... creates 15 static cylinders, no Update() movement
+}
+```
+
+These 15 cylinders sit at fixed world positions. The player is stationary at Z=0, obstacles scroll backward — but lane markers don't, so the visual field is a mix of moving obstacles and frozen ground details, undermining immersion.
+
+**Solution**: Replace static markers with a pooling + scrolling system that mirrors the existing `Obstacle` + `ObstacleSpawner` pattern. A `LaneMarker` MonoBehaviour scrolls each marker backward each frame and self-recycles when past the player. A `LaneMarkerSpawner` manages an `ObjectPool<GameObject>` and continuously places markers ahead of the player across all three lanes.
+
+**Fix Strategy** (per SOTA recommendations — Solution 1 + 4):
+1. Create `LaneMarker.cs` — mirrors `Obstacle.cs`: per-frame `transform.position += Vector3.back * speed * dt`, recycle when `z < player.z - threshold`.
+2. Create `LaneMarkerSpawner.cs` — mirrors `ObstacleSpawner.cs`: `ObjectPool<GameObject>`, factory using `Placeholders.CreatePrimitive(Cylinder, ...)`, continuous placement across all 3 lanes.
+3. Replace `CreateLaneMarkers()` in `SceneBootstrapper` with creation of a `LaneMarkerSpawner` GameObject.
+
+---
+
+## Architecture Diagram
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                       SceneBootstrapper                              │
-│  BuildScene(): wires Player + ObstacleSpawner + GameManager + UI     │
-│                                                                       │
-│  FIX #2: Remove ground.tag = "Ground";  ← Line 74 — dead code,       │
-│           no code depends on this tag, and it's not registered        │
-└───────┬──────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  ┌────────────────────┐    ┌────────────────────────────────────┐    │
-│  │     Player         │    │  ObstacleSpawner                   │    │
-│  │   (Capsule)        │    │  (standalone GO)                   │    │
-│  │  ┌───────────────┐ │    │  ┌──────────────────────────────┐  │    │
-│  │  │ Rigidbody     │ │    │  │ ObjectPool<GameObject>       │  │    │
-│  │  │ (dynamic,     │ │    │  │                              │  │    │
-│  │  │  CCD=Cont.Dyn)│ │    │  │ CreateObstacle():            │  │    │
-│  │  └───────┬───────┘ │    │  │   cube = CreatePrimitive()   │  │    │
-│  │          │          │    │  │   cube.AddComponent<Obstacle>│  │    │
-│  │  ┌───────┴───────┐ │    │  │                               │  │    │
-│  │  │ CapsuleCollider│ │    │  │ FIX #1:                      │  │    │
-│  │  └───────┬───────┘ │    │  │   cube.AddComponent<Rigidbody> │  │    │
-│  │          │          │    │  │     .isKinematic = true;     │  │    │
-│  │  ┌───────┴───────┐ │    │  │   ← One line added            │  │    │
-│  │  │ PlayerControl │ │    │  └──────────────────────────────┘  │    │
-│  │  │               │ │    │                                    │    │
-│  │  │ OnCollision   │ │    │ Obstacle.Update():                 │    │
-│  │  │ Enter()       │ │    │   transform.position +=            │    │
-│  │  │  (UNCHANGED)  │ │    │     Vector3.back * speed * dt;    │    │
-│  │  │  GetComponent │ │    │   ← Transform movement unchanged   │    │
-│  │  │  <Obstacle>() │ │    │                                    │    │
-│  │  └───────┬───────┘ │    └────────────────────────────────────┘    │
-│  │          │          │                                              │
-│  └──────────┼──────────┘                                              │
-│             │                                                         │
-│  ┌──────────┴──────────────────────────────────────────────────┐     │
-│  │                    GameManager                               │     │
-│  │  GameOver() → IsGameOver=true, OnGameOver event             │     │
-│  │  (NO CHANGE)                                                 │     │
-│  └──────────┬──────────────────────────────────────────────────┘     │
-│             │                                                         │
-│  ┌──────────┴──────────┐                                              │
-│  │      UIManager       │                                             │
-│  │  ShowGameOver()      │                                             │
-│  │  (NO CHANGE)         │                                             │
-│  └─────────────────────┘                                              │
+│                     SceneBootstrapper.BuildScene()                     │
+│                                                                        │
+│  NEW ORDER:                                                            │
+│  1. Physics                                                            │
+│  2. Ground Plane                                                       │
+│  3. Player Capsule (InputHandler + PlayerController + WindEffect)      │
+│  4. Camera                                                             │
+│  ─── GameManager BEFORE UI ───                                        │
+│  5. GameManager ← MOVED EARLIER (was after UI)                        │
+│  6. UI Canvas + UIManager ← NOW AFTER GameManager                     │
+│     └─ ScoreText, GameOverPanel (with white sprite), children          │
+│     └─ UIManager.WireReferences() called explicitly                    │
+│  7. EventSystem                                                        │
+│  8. ObstacleSpawner                                                    │
+│  9. LaneMarkerSpawner ← NEW: replaces CreateLaneMarkers()              │
+│  10. Self-destruct                                                     │
 └──────────────────────────────────────────────────────────────────────┘
-```
 
-### Data Flow (Collision → Game Over)
+┌──────────────────────────────────────────────────────────────────────┐
+│                         NEW: LaneMarkerSpawner                         │
+│                                                                        │
+│  Awake():                                                              │
+│    └─ Create ObjectPool<GameObject>                                    │
+│       └─ Factory: Placeholders.CreatePrimitive(Cylinder, darkGray)     │
+│       └─ + AddComponent<LaneMarker>()                                  │
+│                                                                        │
+│  Update():                                                             │
+│    └─ Guard: GameManager.Instance != null && !IsGameOver               │
+│    └─ Advance _scrollDistance counter                                  │
+│    └─ If _scrollDistance > _nextSpawnZ:                                │
+│       └─ For each of 3 lanes:                                          │
+│          └─ pool.Get() → Configure → position ahead                    │
+│       └─ Advance _nextSpawnZ by _markerSpacing                         │
+└──────────────────────────────────────────────────────────────────────┘
 
-```
-ObstacleSpawner.CreateObstacle()
-  └─ Placeholders.CreatePrimitive(Cube, red, "Obstacle")
-  └─ cube.AddComponent<Obstacle>()
-  └─ cube.AddComponent<Rigidbody>().isKinematic = true;    ← FIX #1: kinematic Rigidbody added
+┌──────────────────────────────────────────────────────────────────────┐
+│                         NEW: LaneMarker                                │
+│                                                                        │
+│  Configure(releaseAction, player):                                     │
+│    └─ Cache _scrollSpeed (from GameManager.ForwardSpeed)               │
+│    └─ Cache _releaseAction, _player reference                          │
+│                                                                        │
+│  Update():                                                             │
+│    └─ transform.position += Vector3.back * _scrollSpeed * dt           │
+│    └─ if z < player.z - 10f:  _releaseAction(gameObject)               │
+│                                                                        │
+│  OnDisable():                                                          │
+│    └─ Safety net: release back to pool if configured                   │
+└──────────────────────────────────────────────────────────────────────┘
 
-Obstacle.Update()
-  └─ transform.position += Vector3.back * _scrollSpeed * dt;
-     ← Physics engine NOW tracks this movement because Rigidbody exists (even though isKinematic)
-     ← Collision events fire reliably between this GameObject and the player's dynamic Rigidbody
+┌──────────────────────────────────────────────────────────────────────┐
+│                    MODIFIED: UIManager                                  │
+│                                                                        │
+│  NEW: public void WireReferences(                                      │
+│      TextMeshProUGUI scoreText,                                        │
+│      GameObject gameOverPanel,                                         │
+│      TextMeshProUGUI gameOverScoreText,                                │
+│      TextMeshProUGUI gameOverTitle,   ← NEW                            │
+│      TextMeshProUGUI restartPrompt    ← NEW                            │
+│  )                                                                     │
+│                                                                        │
+│  ShowGameOver():                                                       │
+│    └─ panel.SetActive(true)                                            │
+│    └─ _gameOverTitle.text = "Game Over!"                               │
+│    └─ _gameOverScoreText.text = $"Distance: {distance:F0}m"            │
+│    └─ _restartPrompt.text = "Press R to restart"                       │
+│    └─ Defensive: if any ref is null, try GameObject.Find fallback      │
+└──────────────────────────────────────────────────────────────────────┘
 
-Player Collision Event (Physics Engine)
-  └─ PlayerController.OnCollisionEnter(Collision collision)
-     ├─ if (_isDead) return;                     ← Existing double-trigger guard
-     ├─ if (collision.gameObject.GetComponent<Obstacle>() != null)  ← Existing check (component-based)
-     │   ├─ _isDead = true;
-     │   ├─ renderer.material.color = Color.red;  ← Existing death visual
-     │   └─ GameManager.Instance.GameOver();       ← Existing death notification
-     │       └─ GameManager.OnGameOver event
-     │           └─ UIManager.ShowGameOver()       ← Panel visible, final distance shown
-     │
-     └─ else (ground, lane markers, walls): nothing — no Obstacle component
+Collision → Game Over Data Flow (unchanged, just verified working):
+  Obstacle (kinematic Rigidbody) ──collision──▶ PlayerController
+    .OnCollisionEnter() → GetComponent<Obstacle>() != null
+    → _isDead = true → renderer.material.color = Color.red
+    → GameManager.Instance.GameOver()
+      → IsGameOver = true, OnGameOver?.Invoke()
+        → UIManager.ShowGameOver()
+          → _gameOverPanel.SetActive(true) [Image renders dark overlay]
+          → Populate title, score, restart prompt on dedicated children
 ```
 
 ---
 
-## File Structure
+## File Changes Summary
 
-```
-Assets/
-  Scripts/
-    ObstacleSpawner.cs        — (MODIFY) Add kinematic Rigidbody in CreateObstacle()
-    SceneBootstrapper.cs      — (MODIFY) Remove ground.tag = "Ground";
-    Obstacle.cs               — (NO CHANGE) Transform-based movement preserved
-    PlayerController.cs       — (NO CHANGE) OnCollisionEnter already uses GetComponent<Obstacle>()
-    GameManager.cs            — (NO CHANGE)
-    Placeholders.cs           — (NO CHANGE)
-    InputHandler.cs           — (NO CHANGE)
-    CameraFollow.cs           — (NO CHANGE)
-    UIManager.cs              — (NO CHANGE)
-    WindEffect.cs             — (NO CHANGE)
-  Editor/
-    SceneBaker.cs             — (NO CHANGE)
-RESOURCES.md                  — (MODIFY) Remove "Ground" tag from troubleshooting
-```
+| File | Action | Description |
+|------|--------|-------------|
+| `Assets/Scripts/LaneMarker.cs` | **NEW** | MonoBehaviour: per-frame scroll + pool recycle for lane marker cylinders |
+| `Assets/Scripts/LaneMarkerSpawner.cs` | **NEW** | MonoBehaviour: ObjectPool management, continuous 3-lane marker placement |
+| `Assets/Scripts/UIManager.cs` | **MODIFY** | Add `WireReferences()` method; refactor `ShowGameOver()` to populate dedicated child text elements; add defensive null fallbacks |
+| `Assets/Scripts/SceneBootstrapper.cs` | **MODIFY** | Reorder GameManager before UI; wire UIManager references explicitly; replace `CreateLaneMarkers()` with `LaneMarkerSpawner` creation; assign white sprite to GameOverPanel Image |
+| `RESOURCES.md` | **MODIFY** | Add `LaneMarker`, `LaneMarkerSpawner` to file structure; update troubleshooting |
 
 ---
 
 ## Component Specifications
 
-### 1. ObstacleSpawner (MODIFY — Bug 1: Collision Fix)
+### 1. LaneMarker (NEW)
 
-**File**: `Assets/Scripts/ObstacleSpawner.cs`
+**File**: `Assets/Scripts/LaneMarker.cs`
 
-**Change**: Add one line in `CreateObstacle()` — a kinematic Rigidbody on the obstacle cube.
+**Purpose**: Attached to each pooled lane marker cylinder. Handles per-frame backward scrolling (matching `GameManager.ForwardSpeed`) and self-return to the pool when the marker passes behind the player.
 
-**Before** (lines 165–170):
+**Pattern**: Direct mirror of `Obstacle.cs` — same structure, same lifecycle, but no collision detection dependency.
+
+**Serialized Fields**: None (all configuration injected via `Configure()`).
+
+**Public API**:
+
 ```csharp
-private GameObject CreateObstacle()
+public void Configure(System.Action<GameObject> releaseAction, Transform player)
+```
+
+- `releaseAction`: Callback to return this GameObject to the pool (typically `(go) => pool.Release(go)`).
+- `player`: The player's Transform, used to determine the recycle threshold.
+
+**Update() behavior**:
+1. Guard: return if not configured, or if `_player`/`_releaseAction` is null.
+2. `transform.position += Vector3.back * _scrollSpeed * Time.deltaTime;`
+3. If `transform.position.z < _player.position.z - 10f`: set `_configured = false`, call `_releaseAction(gameObject)`.
+
+**OnDisable() behavior**: Same safety net as `Obstacle.cs` — if configured, release back to pool so pool counts stay consistent during scene reload.
+
+**Key design decisions**:
+- No Rigidbody needed: lane markers are purely visual — they don't need to trigger collisions. Not adding a Rigidbody avoids false collision events with the player and keeps the markers lightweight.
+- `_scrollSpeed` cached from `GameManager.Instance.ForwardSpeed` at configuration time (with 8f fallback), matching `Obstacle.cs`.
+- Recycle threshold of `player.z - 10f` matches `Obstacle.cs` and is comfortably behind the camera.
+- `_configured` flag guards against double-release and uninitialized updates.
+
+---
+
+### 2. LaneMarkerSpawner (NEW)
+
+**File**: `Assets/Scripts/LaneMarkerSpawner.cs`
+
+**Purpose**: Manages an `ObjectPool<GameObject>` of lane marker cylinders and continuously places them across all three lanes ahead of the player, producing an infinite backward-scrolling lane-dividing effect.
+
+**Pattern**: Mirror of `ObstacleSpawner.cs` with lane-marker-specific tweaks.
+
+**Serialized Fields (Self-Supplying)**:
+
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `_markerMaterial` | `Material` | null → dark gray placeholder | Material for marker cylinders |
+| `_markerSpacing` | `float` | `6f` | Z-distance between successive rows of markers |
+| `_spawnDistance` | `float` | `40f` | How far ahead of the player markers are spawned |
+| `_poolDefaultCapacity` | `int` | `15` | Pre-allocated pool entries |
+| `_poolMaxSize` | `int` | `30` | Pool cap |
+
+**Runtime State**:
+- `_pool`: `ObjectPool<GameObject>` — owns all marker cylinder GameObjects.
+- `_player`: `Transform` — discovered via `GameObject.FindGameObjectWithTag("Player")`.
+- `_scrollDistance`: `float` — virtual scroll counter (same pattern as `ObstacleSpawner._scrollDistance`).
+- `_nextSpawnZ`: `float` — threshold for next spawn row.
+- Lane offsets: `{ -2.5f, 0f, 2.5f }` — matches `PlayerController._laneDistance`.
+
+**Factory (`CreateMarker()`)**:
+```csharp
+GameObject marker = Placeholders.CreatePrimitive(PrimitiveType.Cylinder, darkGray, "LaneMarker");
+marker.transform.localScale = new Vector3(0.2f, 0.05f, 0.2f);
+marker.AddComponent<LaneMarker>();
+// NO Rigidbody — markers are visual-only, should not participate in physics
+return marker;
+```
+
+**Update() behavior**:
+1. Guard: `GameManager.Instance == null || GameManager.Instance.IsGameOver || _player == null` → return.
+2. `_scrollDistance += GameManager.Instance.ForwardSpeed * Time.deltaTime;`
+3. If `_scrollDistance >= _nextSpawnZ`:
+   - For each of the 3 lane X offsets:
+     - `GameObject marker = _pool.Get();`
+     - Position at `(laneX, 0.025f, _player.position.z + _spawnDistance)`
+     - `marker.GetComponent<LaneMarker>().Configure((go) => _pool.Release(go), _player);`
+   - `_nextSpawnZ = _scrollDistance + _markerSpacing;`
+
+**Key design decisions**:
+- **All 3 lanes spawn together**: Unlike obstacles (which pick random lanes with same-lane avoidance), lane markers are supposed to mark all lanes equally. Each spawn event places one marker in each of the 3 lanes simultaneously, creating a continuous "row" of markers scrolling backward.
+- **No same-lane avoidance needed**: Markers are uniformly distributed across all lanes — there's no gameplay reason to avoid a lane.
+- **Virtual scroll distance**: Uses the same `_scrollDistance` pattern as `ObstacleSpawner` to decouple spawning from the player's actual Z position (player is stationary at Z=0).
+- **No Rigidbody on markers**: Markers are purely decorative. Adding a Rigidbody would cause unnecessary physics overhead and could trigger false `OnCollisionEnter` calls on the player. The player's death check (`GetComponent<Obstacle>()`) already excludes lane markers.
+- **Collision safety**: The player's `OnCollisionEnter` only triggers death when `collision.gameObject.GetComponent<Obstacle>() != null`. Lane markers have a `LaneMarker` component, not an `Obstacle` component, so they can never cause a false death — even if the player physically touches a marker cylinder.
+
+---
+
+### 3. UIManager (MODIFY)
+
+**File**: `Assets/Scripts/UIManager.cs`
+
+**Changes**:
+
+#### 3a. New Serialized Fields
+
+```csharp
+[SerializeField] private TextMeshProUGUI _gameOverTitle;
+[SerializeField] private TextMeshProUGUI _restartPrompt;
+```
+
+These reference the `GameOverTitle` and `RestartPrompt` TMP children of the GameOverPanel. Both are self-supplying: discovered via `_gameOverPanel.transform.Find("GameOverTitle")` / `Find("RestartPrompt")` in `Start()` if null.
+
+#### 3b. New Public Method: `WireReferences`
+
+```csharp
+/// <summary>
+/// Called by SceneBootstrapper.BuildScene() to directly wire all UI references,
+/// bypassing the GameObject.Find self-supply path. Keeps self-supply as fallback.
+/// </summary>
+public void WireReferences(
+    TextMeshProUGUI scoreText,
+    GameObject gameOverPanel,
+    TextMeshProUGUI gameOverTitle,
+    TextMeshProUGUI gameOverScoreText,
+    TextMeshProUGUI restartPrompt)
 {
-    Color color = _obstacleMaterial != null ? _obstacleMaterial.color : Color.red;
-    GameObject cube = Placeholders.CreatePrimitive(PrimitiveType.Cube, color, "Obstacle");
-    cube.AddComponent<Obstacle>();
-    return cube;
+    _scoreText = scoreText;
+    _gameOverPanel = gameOverPanel;
+    _gameOverTitle = gameOverTitle;
+    _gameOverScoreText = gameOverScoreText;
+    _restartPrompt = restartPrompt;
 }
 ```
 
-**After**:
+This eliminates reliance on `GameObject.Find` at runtime when the bootstrapper is used, while preserving the self-supply fallback for baked scenes where the bootstrapper might not be present.
+
+#### 3c. Refactored `ShowGameOver()`
+
 ```csharp
-private GameObject CreateObstacle()
+public void ShowGameOver()
 {
-    Color color = _obstacleMaterial != null ? _obstacleMaterial.color : Color.red;
-    GameObject cube = Placeholders.CreatePrimitive(PrimitiveType.Cube, color, "Obstacle");
-    cube.AddComponent<Obstacle>();
-    cube.AddComponent<Rigidbody>().isKinematic = true;
-    return cube;
+    // Defensive fallback: if references are null (e.g., baked scene without WireReferences),
+    // try GameObject.Find as a last resort.
+    if (_gameOverPanel == null)
+        _gameOverPanel = GameObject.Find("GameOverPanel");
+
+    if (_gameOverPanel != null)
+        _gameOverPanel.SetActive(true);
+
+    // Populate dedicated children (with fallback discovery)
+    if (_gameOverTitle == null && _gameOverPanel != null)
+        _gameOverTitle = _gameOverPanel.transform.Find("GameOverTitle")?.GetComponent<TextMeshProUGUI>();
+
+    if (_gameOverScoreText == null && _gameOverPanel != null)
+        _gameOverScoreText = _gameOverPanel.transform.Find("GameOverScoreText")?.GetComponent<TextMeshProUGUI>();
+
+    if (_restartPrompt == null && _gameOverPanel != null)
+        _restartPrompt = _gameOverPanel.transform.Find("RestartPrompt")?.GetComponent<TextMeshProUGUI>();
+
+    if (_gameOverTitle != null)
+        _gameOverTitle.text = "Game Over!";
+
+    if (_gameOverScoreText != null && GameManager.Instance != null)
+        _gameOverScoreText.text = $"Distance: {GameManager.Instance.Distance:F0}m";
+
+    if (_restartPrompt != null)
+        _restartPrompt.text = "Press R to restart";
+
+    Debug.Log("UIManager.ShowGameOver: Panel activated, text populated.");
 }
 ```
 
-**Rationale**:
+Key improvements:
+- Each child text element (`GameOverTitle`, `GameOverScoreText`, `RestartPrompt`) is populated individually rather than shoving everything into `_gameOverScoreText`.
+- Defensive `GameObject.Find` fallback at call time if any reference is null (handles baked-scene edge case).
+- Debug log for traceability.
 
-- **Root cause**: Without a Rigidbody, Unity treats the obstacle's `BoxCollider` as a **static collider**. When a static collider is moved via `Transform.position` (as `Obstacle.Update()` does), the physics engine does NOT track its per-frame movement, and `OnCollisionEnter` on a dynamic Rigidbody (the player) is **not reliably called**. This is the fundamental reason player-obstacle collisions fail to trigger Game Over.
+#### 3d. Updated `Start()` Self-Supply
 
-- **Why kinematic Rigidbody**: `isKinematic = true` tells the physics engine "this body moves via script, not physics forces, but please track its position each frame for collision purposes." Kinematic bodies are specifically designed for Transform-moved objects that need to participate in collision detection with dynamic Rigidbodies.
+Add discovery for the two new fields:
 
-- **Movement code unchanged**: `Obstacle.Update()` continues to use `transform.position += Vector3.back * _scrollSpeed * Time.deltaTime`. Kinematic Rigidbodies are expected to be moved via Transform — this is the idiomatic Unity pattern.
+```csharp
+if (_gameOverTitle == null && _gameOverPanel != null)
+{
+    Transform child = _gameOverPanel.transform.Find("GameOverTitle");
+    if (child != null) _gameOverTitle = child.GetComponent<TextMeshProUGUI>();
+}
 
-- **Performance**: At most 25 pooled obstacles exist at any time. Adding a kinematic Rigidbody to each has zero measurable performance impact.
+if (_restartPrompt == null && _gameOverPanel != null)
+{
+    Transform child = _gameOverPanel.transform.Find("RestartPrompt");
+    if (child != null) _restartPrompt = child.GetComponent<TextMeshProUGUI>();
+}
+```
 
-- **No interference with the pool**: The ObjectPool's `actionOnGet`/`actionOnRelease` callbacks (SetActive true/false) work identically with or without a Rigidbody component.
+---
 
-- **Compatibility**: Works identically in Play mode, baked scenes (Editor), and built players. The Rigidbody is a standard Unity component with no external dependencies.
-
-### 2. SceneBootstrapper (MODIFY — Bug 2: Undefined "Ground" Tag)
+### 4. SceneBootstrapper (MODIFY)
 
 **File**: `Assets/Scripts/SceneBootstrapper.cs`
 
-**Change**: Remove the `ground.tag = "Ground";` assignment on line 74.
+**Changes**:
 
-**Before** (lines 64–74):
+#### 4a. Reorder: GameManager Before UI
+
+Move the GameManager creation block (currently lines 236–237) to BEFORE the UI Canvas block (currently lines 118–224). After the move, the section order is:
+
+```
+5. GameManager          ← MOVED UP (was #7)
+6. UI Canvas + UIManager ← Was #5, now #6 (after GameManager)
+7. EventSystem
+8. ObstacleSpawner
+9. LaneMarkerSpawner     ← NEW (was CreateLaneMarkers)
+```
+
+This ensures `GameManager.Instance` is available before `UIManager.Start()` runs, making the `TrySubscribeEvents()` retry loop succeed on the first attempt.
+
+#### 4b. Wire UIManager References Explicitly
+
+After creating all UI elements and before adding `UIManager`, capture references and pass them via `WireReferences()`:
+
 ```csharp
-// --- 2. Ground Plane ---
-GameObject ground = Placeholders.CreatePrimitive(
-    PrimitiveType.Plane,
-    new Color(0.3f, 0.3f, 0.3f),
-    "Ground"
-);
-ground.transform.position = new Vector3(0f, 0f, 10f);
-ground.transform.localScale = new Vector3(3f, 1f, 200f);
-ground.tag = "Ground";
+// After creating ScoreText, GameOverPanel, GameOverTitle, GameOverScoreText, RestartPrompt:
+
+// Assign a white 1×1 sprite to the GameOverPanel Image so it always renders
+// as a solid color rectangle (some Unity versions skip Image rendering when
+// no Source Image is assigned).
+Texture2D whiteTex = new Texture2D(1, 1);
+whiteTex.SetPixel(0, 0, Color.white);
+whiteTex.Apply();
+panelImage.sprite = Sprite.Create(whiteTex, new Rect(0, 0, 1, 1), new Vector2(0.5f, 0.5f));
+
+// Wire UIManager references explicitly (eliminates GameObject.Find dependency)
+UIManager uiManager = uiGo.AddComponent<UIManager>();
+uiManager.WireReferences(scoreText, panelGo, titleText, gameOverScoreText, promptText);
 ```
 
-**After**:
+The `whiteTex` sprite ensures the `Image` component always has a Source Image — a solid white 1×1 texture tinted by `panelImage.color` (black, 0.7 alpha) to produce the dark overlay.
+
+#### 4c. Replace `CreateLaneMarkers()` with LaneMarkerSpawner
+
+Remove the `CreateLaneMarkers()` private method entirely. Replace the call at line 244 with:
+
 ```csharp
-// --- 2. Ground Plane ---
-GameObject ground = Placeholders.CreatePrimitive(
-    PrimitiveType.Plane,
-    new Color(0.3f, 0.3f, 0.3f),
-    "Ground"
-);
-ground.transform.position = new Vector3(0f, 0f, 10f);
-ground.transform.localScale = new Vector3(3f, 1f, 200f);
+// --- 9. LaneMarkerSpawner (scrolling lane markers — replaces static CreateLaneMarkers) ---
+GameObject markerSpawnerGo = new GameObject("LaneMarkerSpawner");
+markerSpawnerGo.AddComponent<LaneMarkerSpawner>();
 ```
 
-**Rationale**:
-
-- **Root cause**: `ground.tag = "Ground"` sets a tag that does not exist in Unity's tag database. Unity only provides "Player", "MainCamera", "Untagged", "Respawn", "Finish", and "EditorOnly" as built-in tags. "Ground" is a custom string with no corresponding entry in `ProjectSettings/TagManager.asset` (`tags: []`), so Unity logs a console error at runtime.
-
-- **No code depends on this tag**: A grep of the entire codebase confirms the "Ground" tag is never read — no `CompareTag("Ground")`, no `GameObject.FindGameObjectWithTag("Ground")`, no tag-based filtering on raycasts. The `PlayerController._isGrounded` check uses `Physics.Raycast(transform.position, Vector3.down, _groundCheckDistance)` with **no tag filter** — it hits any collider below the player (including the ground Plane's MeshCollider), so removing the tag has zero effect on gameplay.
-
-- **Zero side effects**: The ground plane retains its default "Untagged" tag. The plane is visually identical, physically identical (MeshCollider intact), and functionally identical.
-
-- **Why not register the tag**: Registering "Ground" in TagManager.asset would require (a) editing a binary `.asset` file (violates project constraints — deliver scripts only), or (b) Editor-only `UnityEditorInternal` APIs (doesn't work in builds). Removing the dead-code assignment is simpler, safer, and build-safe.
-
-### 3. RESOURCES.md (MODIFY — Accuracy Update)
-
-**File**: `RESOURCES.md`
-
-**Change**: Update the troubleshooting entry that incorrectly references the "Ground" tag.
-
-**Before** (line 159):
-```
-- If this occurs, ensure the ground's tag is "Ground" and the player's Rigidbody has `useGravity = true`
-```
-
-**After**:
-```
-- If this occurs, ensure the player's Rigidbody has `useGravity = true` and the ground Plane has a MeshCollider (Unity primitives include this by default)
-```
-
-**Rationale**: Since the "Ground" tag is no longer assigned, the troubleshooting guide should not instruct users to check for it. The correct check is that the ground Plane has its default MeshCollider (always true for Unity primitives) and the player has gravity enabled.
-
-### 4. PlayerController (NO CHANGE — Already Correct)
-
-**File**: `Assets/Scripts/PlayerController.cs`
-
-No modifications needed. The existing code is correct:
-
-- `OnCollisionEnter` (line 193) uses `GetComponent<Obstacle>() != null` (line 208) — component-based detection, no tag dependency.
-- `_isDead` guard (line 200) prevents double-trigger.
-- Death behavior (lines 210–223): material color → red, `GameManager.Instance.GameOver()`.
-- `CollisionDetectionMode.ContinuousDynamic` (line 112) prevents bullet-through-paper tunneling.
-- Player Rigidbody is dynamic (non-kinematic) — set up in `Awake()` (lines 102–112) and `SceneBootstrapper.BuildScene()` (lines 87–90).
-
-The only reason `OnCollisionEnter` was not firing is that obstacles lacked a Rigidbody — fixed by the ObstacleSpawner change above.
+The `LaneMarkerSpawner` self-discovers the player via tag and self-supplies its material, so no further wiring is needed.
 
 ---
 
-## Component Interaction Matrix (Unchanged)
+## New Component Integration in BuildScene()
 
-| From → To | GameManager | PlayerController | ObstacleSpawner | Obstacle | UIManager |
-|------------|:---:|:---:|:---:|:---:|:---:|
-| **GameManager** | — | — | — | — | events |
-| **PlayerController** | `.IsGameOver` `.GameOver()` | — | — | `GetComponent<Obstacle>()` | — |
-| **ObstacleSpawner** | `.IsGameOver` `.ForwardSpeed` | `.position.z` | — | `.Configure()` | — |
-| **Obstacle** | `.ForwardSpeed` (cached) | `.position.z` | — | — | — |
-| **UIManager** | `.Distance` `.OnGameOver` `.OnRestart` | — | — | — | — |
+### Updated BuildScene() Section Order
 
-All interactions are unchanged. The two fixes are purely internal to `ObstacleSpawner.CreateObstacle()` (adds a component) and `SceneBootstrapper.BuildScene()` (removes a dead line).
+```
+1. Physics.gravity
+2. Ground Plane
+3. Player Capsule + Rigidbody + InputHandler + PlayerController + WindEffect
+4. Main Camera + CameraFollow
+5. GameManager          ← MOVED UP (was after UI)
+6. UI Canvas:
+   - Canvas + CanvasScaler + GraphicRaycaster
+   - ScoreText (TMP)
+   - GameOverPanel (Image with white sprite) + GameOverTitle + GameOverScoreText + RestartPrompt
+   - UIManager (added, then WireReferences called)
+7. EventSystem
+8. ObstacleSpawner
+9. LaneMarkerSpawner    ← NEW (replaces CreateLaneMarkers)
+10. Self-destruct (Play mode)
+```
 
----
+### Both Paths Covered
 
-## Integration in SceneBootstrapper.BuildScene()
-
-**No wiring changes needed.** The two fixes are self-contained:
-
-1. **ObstacleSpawner** is created by `BuildScene()` at lines 241–242 (`spawnerGo.AddComponent<ObstacleSpawner>()`). The `ObstacleSpawner.Awake()` creates the ObjectPool, and `CreateObstacle()` (the factory callback) now includes the kinematic Rigidbody. No bootstrapper change required — the spawner's internal behavior is transparent to the rest of the system.
-
-2. **Ground Plane** is created at lines 64–73. The `ground.tag = "Ground"` line is simply removed. The ground remains at the same position, scale, and with the same MeshCollider.
-
-Both the runtime path (`Awake()` → `BuildScene()`) and the Editor bake path (`Tools > Bake Scene to Hierarchy` → `BuildScene()`) execute the same `BuildScene()` method, so both fixes work identically in both modes.
+- **Play mode** (`Awake()` → `BuildScene()`): All objects created fresh. UIManager receives explicit references via `WireReferences()`. LaneMarkerSpawner manages scrolling markers.
+- **Editor Bake** (`Tools > Bake Scene to Hierarchy`): Same `BuildScene()` called. Generated objects persist in hierarchy. On next Play, UIManager.Start() self-supplies references as fallback (since WireReferences was only called during bake, not on deserialization).
 
 ---
 
@@ -264,23 +452,14 @@ Both the runtime path (`Awake()` → `BuildScene()`) and the Editor bake path (`
 
 | Concern | Technology | Rationale |
 |---------|-----------|-----------|
-| Engine | Unity 6 (6000.0+) | Required by project |
+| Engine | Unity 6 (6000.0+) | Project constraint |
 | Language | C# (pure scripts) | Project constraint |
-| Collision detection | `MonoBehaviour.OnCollisionEnter(Collision)` | Existing callback, now reliably triggered |
-| Obstacle Rigidbody | `Rigidbody.isKinematic = true` | One-line addition, enables physics tracking of Transform-moved obstacles |
-| Death condition | `GameObject.GetComponent<Obstacle>() != null` | Existing, unchanged — zero-config, build-safe |
-| Ground collision | `Physics.Raycast` (no tag filter) | Existing, unchanged — hits any collider below player |
-| Death response | `GameManager.Instance.GameOver()` + material color change | Existing, unchanged |
-
----
-
-## Bug Fix Traceability
-
-| Issue | Root Cause | Fix | File(s) Changed | Lines Affected |
-|-------|-----------|-----|-----------------|----------------|
-| Player doesn't die on obstacle collision | Obstacles have no Rigidbody → Unity treats them as static colliders. Moving a static collider via `Transform` does not reliably trigger `OnCollisionEnter` on a dynamic Rigidbody. The `PlayerController.OnCollisionEnter` logic and `GetComponent<Obstacle>()` check are correct — the collision event simply never fires. | Add `cube.AddComponent<Rigidbody>().isKinematic = true;` in `ObstacleSpawner.CreateObstacle()`. Kinematic Rigidbodies are tracked by the physics engine, so Transform-moved obstacles now properly trigger collision events on the player's dynamic Rigidbody. | `ObstacleSpawner.cs` | +1 line in `CreateObstacle()` |
-| Console error: "Tag: Ground is not defined" | `SceneBootstrapper.BuildScene()` sets `ground.tag = "Ground"` (line 74), but "Ground" is not a built-in tag and not registered in `ProjectSettings/TagManager.asset` (`tags: []`). No code reads this tag. | Remove `ground.tag = "Ground";` — dead code with zero functional impact. The ground plane retains its default "Untagged" tag and all gameplay behavior is preserved. | `SceneBootstrapper.cs` | −1 line (line 74) |
-| RESOURCES.md references non-existent "Ground" tag | Troubleshooting entry says "ensure the ground's tag is \"Ground\"" — misleading since the tag no longer exists. | Replace with accurate guidance: check gravity and MeshCollider presence. | `RESOURCES.md` | 1 line edit |
+| Marker pooling | `UnityEngine.Pool.ObjectPool<GameObject>` | Same pattern as `ObstacleSpawner`; SOTA-recommended |
+| Marker visuals | `Placeholders.CreatePrimitive(PrimitiveType.Cylinder, ...)` | Existing pattern; project constraint |
+| Marker scrolling | `Transform.position += Vector3.back * speed * dt` | Same pattern as `Obstacle.Update()`; SOTA-recommended |
+| Event subscription | `GameManager.OnGameOver` / `OnRestart` events | Existing system; no change |
+| UI rendering | `Image` with 1×1 white sprite + color tint | Solves Image-without-sprite rendering issue |
+| Explicit wiring | `UIManager.WireReferences()` | Eliminates GameObject.Find dependency at runtime |
 
 ---
 
@@ -288,22 +467,25 @@ Both the runtime path (`Awake()` → `BuildScene()`) and the Editor bake path (`
 
 | Edge Case | Mitigation | Where |
 |-----------|-----------|-------|
-| **Double-death trigger** (simultaneous collisions) | Existing `_isDead` guard at top of `OnCollisionEnter` — returns immediately if already dead | `PlayerController.cs` line 200 |
-| **Ground collision false-positive death** | Ground plane has no `Obstacle` component → `GetComponent<Obstacle>()` returns `null` → death not triggered | Implicit via component absence |
-| **Lane marker collision false-positive death** | Lane markers are Cylinder primitives with no `Obstacle` component → `GetComponent<Obstacle>()` returns `null` | Implicit via component absence |
-| **Bullet-through-paper tunneling** (8 units/s scroll speed) | Player already has `CollisionDetectionMode.ContinuousDynamic` (line 112). Obstacles now have Rigidbody, so CCD fully activates — both bodies are tracked by the physics engine at sub-frame granularity. | `PlayerController.cs` line 112 + `ObstacleSpawner.cs` kinematic Rigidbody |
-| **Pool lifecycle with kinematic Rigidbody** | `ObjectPool.actionOnRelease` calls `SetActive(false)` — Rigidbody is disabled along with the GameObject. `actionOnGet` calls `SetActive(true)` — Rigidbody reactivates. No special handling needed. | `ObstacleSpawner.Awake()` pool setup (lines 140–148) |
-| **Scene reload (R key restart)** | `SceneManager.LoadScene` destroys all objects, including pooled obstacles and their Rigidbodies. Fresh scene load creates new pool and new obstacles. No stale state. | `GameManager.Restart()` (line 116) |
-| **Baked scene compatibility** | Kinematic Rigidbody is a standard Unity component serialized normally. Baked obstacles in Edit mode have the same component structure as runtime obstacles. | Edit-mode bake via `SceneBaker.cs` |
-| **Obstacle child colliders (future)** | Not applicable — obstacles are simple Cube primitives with no children. `GetComponent<Obstacle>()` on `collision.gameObject` (the root) is correct. | N/A |
+| **Image renders as invisible** (no Source Image sprite) | White 1×1 `Texture2D` assigned as `Sprite` on GameOverPanel `Image` | `SceneBootstrapper.BuildScene()` |
+| **UIManager references null in baked scene** | `ShowGameOver()` defensive `GameObject.Find` fallback if any reference is null | `UIManager.ShowGameOver()` |
+| **Event subscription race** (GameManager null during Start) | GameManager created BEFORE UI in BuildScene; `[DefaultExecutionOrder(-100)]` as existing safety; `TrySubscribeEvents` retry loop as existing safety | `SceneBootstrapper.BuildScene()` order |
+| **GameOverPanel children not populated** | `ShowGameOver()` now sets `GameOverTitle`, `GameOverScoreText`, `RestartPrompt` individually | `UIManager.ShowGameOver()` |
+| **Lane markers collide with player** (false death) | Markers have `LaneMarker` component, not `Obstacle`; `PlayerController.OnCollisionEnter` checks `GetComponent<Obstacle>() != null` — markers don't match. No Rigidbody on markers → physics overhead avoided. | `LaneMarker.cs` (no Obstacle component), `PlayerController.cs` line 208 |
+| **Marker pool starvation on restart** | `SceneManager.LoadScene` destroys all objects; new `LaneMarkerSpawner.Awake()` creates fresh pool | `LaneMarkerSpawner.Awake()` |
+| **Markers recycle too early/late** (visual pop) | Recycle threshold `player.z - 10f` matches `Obstacle.cs`; camera far clip is 100f, so markers are well off-screen before recycling | `LaneMarker.Update()` |
+| **Speed mismatch with obstacles** | Both `LaneMarker` and `Obstacle` read `GameManager.Instance.ForwardSpeed` (8f) | `LaneMarker.Configure()`, `Obstacle.Configure()` |
+| **Markers render on top of obstacles** | Markers are at Y=0.025 (ground level); obstacles are at Y=0.5 — physically separated, no Z-fighting | `LaneMarkerSpawner` positioning |
+| **R key restart after game over** | Existing `UIManager.CheckRestartInput()` → `GameManager.Restart()` → `SceneManager.LoadScene()` — unchanged | `UIManager.Update()` |
 
 ---
 
 ## Extensibility Points (Future, Not Implemented Now)
 
-- **Variable obstacle mass/size**: The kinematic Rigidbody can be configured with different mass values for physics material-based bounce effects, though currently unused.
-- **Obstacle-type variants**: If new obstacle types are introduced (e.g., `TallObstacle : Obstacle`), `GetComponent<Obstacle>()` naturally matches all subclasses via polymorphism. No code change needed.
-- **Death effects**: The `_isDead = true` block in `OnCollisionEnter` can be extended with particle effects, screen shake, or audio — all within the same callback, without touching the detection logic.
+- **Variable marker density**: `LaneMarkerSpawner._markerSpacing` can be reduced for denser markers or increased for sparser ones — exposed as `[SerializeField]`.
+- **Marker color/material swap**: `LaneMarkerSpawner._markerMaterial` accepts any material via Inspector or bootstrapper.
+- **Curved/swaying lanes**: If the game ever adds curved lanes, `LaneMarker.Update()` can interpolate X as well as Z.
+- **Obstacle-style lane marker variants**: Different marker types could be added to the pool with a type-selection system (e.g., dashed vs. solid lines).
 
 ---
 
@@ -311,6 +493,8 @@ Both the runtime path (`Awake()` → `BuildScene()`) and the Editor bake path (`
 
 | Criteria | How Fix Achieves It |
 |----------|---------------------|
-| (a) Player-obstacle collision triggers Game Over panel with final distance | Kinematic Rigidbody on obstacles ensures `OnCollisionEnter` fires reliably → `GetComponent<Obstacle>()` check passes → `GameManager.GameOver()` invoked → `UIManager.ShowGameOver()` displays panel and distance score |
-| (b) Pressing R restarts a fresh game | `UIManager.CheckRestartInput()` detects `InputHandler.RestartPressed` → `GameManager.Restart()` → `SceneManager.LoadScene()` — existing flow, unchanged |
-| (c) Zero console errors about undefined tags on startup | `ground.tag = "Ground"` removed from `BuildScene()` — the only source of the "Tag: Ground is not defined" error is eliminated |
+| (1) Crash → dark overlay with "Game Over!", distance, "Press R to restart" | GameOverPanel Image gets a white sprite → always renders as dark overlay. ShowGameOver() populates GameOverTitle, GameOverScoreText, RestartPrompt individually. Explicit WireReferences() eliminates reference-resolution failure. Defensive GameObject.Find fallback catches baked-scene edge case. |
+| (2) Press R → scene reloads, game restarts fresh | Existing `CheckRestartInput()` + `GameManager.Restart()` unchanged |
+| (3) Lane markers scroll backward continuously past player and recycle | `LaneMarkerSpawner` places rows of 3 markers ahead; `LaneMarker.Update()` scrolls them backward at `ForwardSpeed`; recycle at `z < player.z - 10f`; pool returns objects for reuse |
+| (4) No console errors | No tag assignments, no missing references (defensive null checks), no unregistered GameObjects |
+| (5) Zero manual scene setup | All changes in `BuildScene()` + new self-contained components; Play mode and Bake path both covered |
