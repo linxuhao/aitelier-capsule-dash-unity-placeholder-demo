@@ -153,7 +153,9 @@ public class ObstacleSpawner : MonoBehaviour
     /// <summary>
     /// Factory method called by the ObjectPool when a new obstacle is needed.
     /// Creates a red cube primitive, adds the Obstacle component for per-frame
-    /// scroll and pool-return logic.
+    /// scroll and pool-return logic, and adds a kinematic Rigidbody so that
+    /// Transform-based movement from Obstacle.Update() reliably triggers
+    /// OnCollisionEnter on the player's dynamic Rigidbody.
     ///
     /// Note: The Unity tag "Obstacle" is intentionally NOT set on the cube.
     /// Collision detection in PlayerController uses component-based detection
@@ -167,6 +169,9 @@ public class ObstacleSpawner : MonoBehaviour
         Color color = _obstacleMaterial != null ? _obstacleMaterial.color : Color.red;
         GameObject cube = Placeholders.CreatePrimitive(PrimitiveType.Cube, color, "Obstacle");
         cube.AddComponent<Obstacle>();
+        // Add kinematic Rigidbody so the physics engine tracks Transform movement
+        // and reliably triggers OnCollisionEnter on the player's dynamic Rigidbody.
+        cube.AddComponent<Rigidbody>().isKinematic = true;
         return cube;
     }
 
